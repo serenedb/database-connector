@@ -39,8 +39,13 @@ public:
 	                           const std::string &blob_literal_suffix = std::string(),
 	                           const std::string &varchar_comparison_collation = std::string(),
 	                           write_distinct_from_t write_distinct_from = nullptr,
-	                           get_constant_range_t get_constant_range = nullptr);
+	                           get_constant_range_t get_constant_range = nullptr,
+	                           query::Dialect dialect = query::Dialect::Postgres);
 
+	//! All-or-nothing: returns SQL equivalent to the filter, or an empty string
+	//! when any required piece cannot be rendered (the filter must then be
+	//! applied locally). Only optional (advisory) pieces may be dropped from
+	//! the rendered SQL -- correctness never depends on them.
 	static std::string TransformFilter(const Config &config, const std::string &column_name,
 	                                   const duckdb::TableFilter &filter, duckdb::column_t column_id);
 
