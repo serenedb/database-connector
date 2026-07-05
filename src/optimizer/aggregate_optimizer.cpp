@@ -196,6 +196,8 @@ static PushedAggregate TryPushAggregateToMySQL(const AggregateOptimizer::Config 
 			auto new_filter = table_scan::FilterPushdown::TransformFilter(scan_config, column_name.GetIdentifierName(),
 			                                                              entry.Filter(), table_col_idx);
 			if (new_filter.empty()) {
+				// A partial WHERE under a remote aggregate returns wrong numbers;
+				// there is no local re-check once the rows are aggregated away.
 				return res;
 			}
 			if (!where_clause.empty()) {
