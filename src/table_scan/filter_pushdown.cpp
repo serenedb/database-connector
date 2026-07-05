@@ -23,13 +23,14 @@ using namespace duckdb;
 FilterPushdown::Config FilterPushdown::CreateConfig(char identifier_quote, char constant_quote,
                                                     query::QuoteEscapeStyle escape_style,
                                                     const std::string &blob_literal_prefix,
-                                                    const std::string &blob_literal_suffix) {
+                                                    const std::string &blob_literal_suffix, query::Dialect dialect) {
 	Config res;
 	res.identifier_quote = identifier_quote;
 	res.constant_quote = constant_quote;
 	res.escape_style = escape_style;
 	res.blob_literal_prefix = blob_literal_prefix;
 	res.blob_literal_suffix = blob_literal_suffix;
+	res.dialect = dialect;
 	return res;
 }
 
@@ -37,11 +38,22 @@ std::string FilterPushdown::CreateExpression(const query::QueryWriter::Config &i
                                              const query::QueryWriter::Config &constant_config,
                                              const std::string &column_name,
                                              const vector<unique_ptr<Expression>> &filters, const std::string &op,
-                                             column_t column_id) {
+                                             column_t column_id, bool *exact) {
+	const bool is_or = op == "OR";
 	vector<std::string> filter_entries;
 	for (auto &filter : filters) {
-		auto new_filter = TransformExpression(identifier_config, constant_config, column_name, *filter, column_id);
+		auto new_filter =
+		    TransformExpression(identifier_config, constant_config, column_name, *filter, column_id, exact);
 		if (new_filter.empty()) {
+			if (exact) {
+				// Dropping an OR branch would push a wrong subset -> the whole
+				// disjunction stays local. Dropping an AND conjunct pushes a
+				// superset the caller must re-apply locally.
+				if (is_or) {
+					return std::string();
+				}
+				*exact = false;
+			}
 			continue;
 		}
 		filter_entries.push_back(std::move(new_filter));
@@ -92,7 +104,10 @@ string FilterPushdown::TransformConstantFilter(const query::QueryWriter::Config 
 	}
 	auto operator_string = TransformComparison(comparison_type);
 	string comparison = StringUtil::Format("%s %s %s", column_name, operator_string, constant_string);
-	if (constant.type().id() == LogicalTypeId::VARCHAR) {
+	// Postgres forces byte-wise comparison to match DuckDB; ClickHouse's String
+	// comparison is already byte-wise and rejects the COLLATE clause.
+	if (constant.type().id() == LogicalTypeId::VARCHAR &&
+	    constant_config.dialect == query::Dialect::Postgres) {
 		comparison += " COLLATE \"C\"";
 	}
 	return comparison;
@@ -118,8 +133,16 @@ string FilterPushdown::TransformExpressionSubject(const query::QueryWriter::Conf
 		if (struct_type.id() != LogicalTypeId::STRUCT || StructType::IsUnnamed(struct_type)) {
 			return string();
 		}
-		auto child_name = query::QueryWriter::WriteQuotedAndEscaped(
-		    identifier_config, StructType::GetChildName(struct_type, child_idx).GetIdentifierName());
+		auto field = StructType::GetChildName(struct_type, child_idx).GetIdentifierName();
+		if (identifier_config.dialect == query::Dialect::ClickHouse) {
+			// ClickHouse addresses a Tuple field as tupleElement(col, 'name').
+			auto constant_config = query::QueryWriter::CreateConfig('\'', identifier_config.escape_style,
+			                                                        std::string(), std::string(),
+			                                                        identifier_config.dialect);
+			return "tupleElement(" + parent_name + ", " +
+			       query::QueryWriter::WriteQuotedAndEscaped(constant_config, field) + ")";
+		}
+		auto child_name = query::QueryWriter::WriteQuotedAndEscaped(identifier_config, field);
 		return "(" + parent_name + ")." + child_name;
 	}
 	default:
@@ -130,7 +153,7 @@ string FilterPushdown::TransformExpressionSubject(const query::QueryWriter::Conf
 std::string FilterPushdown::TransformExpression(const query::QueryWriter::Config &identifier_config,
                                                 const query::QueryWriter::Config &constant_config,
                                                 const std::string &column_name, const Expression &expr,
-                                                column_t column_id) {
+                                                column_t column_id, bool *exact) {
 	if (BoundComparisonExpression::IsComparison(expr)) {
 		auto &comparison = expr.Cast<BoundFunctionExpression>();
 		auto comparison_type = comparison.GetExpressionType();
@@ -159,10 +182,10 @@ std::string FilterPushdown::TransformExpression(const query::QueryWriter::Config
 		switch (conjunction.GetExpressionType()) {
 		case ExpressionType::CONJUNCTION_AND:
 			return CreateExpression(identifier_config, constant_config, column_name, conjunction.GetChildren(), "AND",
-			                        column_id);
+			                        column_id, exact);
 		case ExpressionType::CONJUNCTION_OR:
 			return CreateExpression(identifier_config, constant_config, column_name, conjunction.GetChildren(), "OR",
-			                        column_id);
+			                        column_id, exact);
 		default:
 			return std::string();
 		}
@@ -199,7 +222,7 @@ std::string FilterPushdown::TransformExpression(const query::QueryWriter::Config
 					in_list += "FALSE";
 				} else {
 					in_list += query::QueryWriter::WriteConstant(
-					    identifier_config, op.GetChildren()[i]->Cast<BoundConstantExpression>().GetValue());
+					    constant_config, op.GetChildren()[i]->Cast<BoundConstantExpression>().GetValue());
 				}
 			}
 			return IsVirtualColumn(column_id) ? "FALSE" : subject + " IN (" + in_list + ")";
@@ -213,13 +236,13 @@ std::string FilterPushdown::TransformExpression(const query::QueryWriter::Config
 		if (func.Function().GetName() == OptionalFilterScalarFun::NAME && func.BindInfo()) {
 			auto &data = func.BindInfo()->Cast<OptionalFilterFunctionData>();
 			return data.child_filter_expr ? TransformExpression(identifier_config, constant_config, column_name,
-			                                                    *data.child_filter_expr, column_id)
+			                                                    *data.child_filter_expr, column_id, exact)
 			                              : std::string();
 		}
 		if (func.Function().GetName() == SelectivityOptionalFilterScalarFun::NAME && func.BindInfo()) {
 			auto &data = func.BindInfo()->Cast<SelectivityOptionalFilterFunctionData>();
 			return data.child_filter_expr ? TransformExpression(identifier_config, constant_config, column_name,
-			                                                    *data.child_filter_expr, column_id)
+			                                                    *data.child_filter_expr, column_id, exact)
 			                              : std::string();
 		}
 		if (func.Function().GetName() == DynamicFilterScalarFun::NAME) {
@@ -233,13 +256,16 @@ std::string FilterPushdown::TransformExpression(const query::QueryWriter::Config
 }
 
 std::string FilterPushdown::TransformFilter(const FilterPushdown::Config &config, const std::string &column_name,
-                                            const TableFilter &filter, column_t column_id) {
-	auto identifier_config = query::QueryWriter::CreateConfig(config.identifier_quote, config.escape_style);
-	auto constant_config = query::QueryWriter::CreateConfig(config.constant_quote, config.escape_style,
-	                                                        config.blob_literal_prefix, config.blob_literal_suffix);
+                                            const TableFilter &filter, column_t column_id, bool *exact) {
+	auto identifier_config =
+	    query::QueryWriter::CreateConfig(config.identifier_quote, config.escape_style, std::string(), std::string(),
+	                                     config.dialect);
+	auto constant_config = query::QueryWriter::CreateConfig(
+	    config.constant_quote, config.escape_style, config.blob_literal_prefix, config.blob_literal_suffix,
+	    config.dialect);
 	std::string column_name_quoted = query::QueryWriter::WriteQuotedAndEscaped(identifier_config, column_name);
 	auto &expr = FilterUtil::GetExpression(filter, "FilterPushdown::TransformFilter");
-	return TransformExpression(identifier_config, constant_config, column_name_quoted, expr, column_id);
+	return TransformExpression(identifier_config, constant_config, column_name_quoted, expr, column_id, exact);
 }
 
 } // namespace table_scan
