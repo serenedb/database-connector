@@ -7,12 +7,13 @@ namespace query {
 
 QueryWriter::Config QueryWriter::CreateConfig(char quote, QuoteEscapeStyle escape_style,
                                               const std::string &blob_literal_prefix,
-                                              const std::string &blob_literal_suffix) {
+                                              const std::string &blob_literal_suffix, Dialect dialect) {
 	Config res;
 	res.quote = quote;
 	res.escape_style = escape_style;
 	res.blob_literal_prefix = blob_literal_prefix;
 	res.blob_literal_suffix = blob_literal_suffix;
+	res.dialect = dialect;
 	return res;
 }
 
@@ -61,6 +62,26 @@ std::string QueryWriter::EncodeBlob(const QueryWriter::Config &config, const std
 std::string QueryWriter::WriteConstant(const QueryWriter::Config &config, const duckdb::Value &val) {
 	using namespace duckdb;
 
+	// Every typed branch below assumes a non-NULL payload (StringValue::Get
+	// throws InternalException on NULL; ToString renders the word NULL inside
+	// a typed cast).
+	if (val.IsNull()) {
+		return "NULL";
+	}
+	// ClickHouse parses a bare literal wider than (U)Int64 as Float64, losing
+	// precision; render (U)HugeInt and Decimal via exact typed casts instead.
+	if (config.dialect == Dialect::ClickHouse) {
+		switch (val.type().id()) {
+		case LogicalTypeId::HUGEINT:
+			return "toInt128('" + val.ToString() + "')";
+		case LogicalTypeId::UHUGEINT:
+			return "toUInt128('" + val.ToString() + "')";
+		case LogicalTypeId::DECIMAL:
+			return "toDecimal128('" + val.ToString() + "', " + std::to_string(DecimalType::GetScale(val.type())) + ")";
+		default:
+			break;
+		}
+	}
 	if (val.type().id() == LogicalTypeId::DOUBLE) {
 		// ERROR:  type "double" does not exist - 'nan'::DOUBLE
 		auto dval = DoubleValue::Get(val);
@@ -80,6 +101,13 @@ std::string QueryWriter::WriteConstant(const QueryWriter::Config &config, const 
 	}
 	if (val.type().id() == LogicalTypeId::TIMESTAMP_TZ) {
 		return val.DefaultCastAs(LogicalType::TIMESTAMP).DefaultCastAs(LogicalType::VARCHAR).ToSQLString();
+	}
+	// A plain string constant: quote + escape per the config's escape_style so the
+	// literal is valid in the target dialect (ClickHouse treats backslash as an
+	// escape inside '...', so its BACKSLASH style escapes both ' and \; postgres'
+	// DOUBLE_QUOTE style doubles ' and leaves \ literal -- matching ToSQLString).
+	if (val.type().id() == LogicalTypeId::VARCHAR) {
+		return WriteQuotedAndEscaped(config, StringValue::Get(val));
 	}
 	return val.DefaultCastAs(LogicalType::VARCHAR).ToSQLString();
 }

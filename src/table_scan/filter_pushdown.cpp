@@ -6,6 +6,7 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -22,13 +23,14 @@ using namespace duckdb;
 
 FilterPushdown::Config
 FilterPushdown::CreateConfig(char identifier_quote, char constant_quote, query::QuoteEscapeStyle escape_style,
-                             const string &blob_literal_prefix, const string &blob_literal_suffix,
-                             const std::string &varchar_comparison_collation, write_distinct_from_t write_distinct_from,
-                             get_constant_range_t get_constant_range) {
+                             query::Dialect dialect, const string &blob_literal_prefix,
+                             const string &blob_literal_suffix, const std::string &varchar_comparison_collation,
+                             write_distinct_from_t write_distinct_from, get_constant_range_t get_constant_range) {
 	Config res;
-	res.identifier_config = query::QueryWriter::CreateConfig(identifier_quote, escape_style);
-	res.constant_config =
-	    query::QueryWriter::CreateConfig(constant_quote, escape_style, blob_literal_prefix, blob_literal_suffix);
+	res.identifier_config =
+	    query::QueryWriter::CreateConfig(identifier_quote, escape_style, std::string(), std::string(), dialect);
+	res.constant_config = query::QueryWriter::CreateConfig(constant_quote, escape_style, blob_literal_prefix,
+	                                                       blob_literal_suffix, dialect);
 	res.varchar_comparison_collation = varchar_comparison_collation;
 	res.write_distinct_from = write_distinct_from;
 	res.get_constant_range = get_constant_range;
@@ -176,11 +178,20 @@ static string WriteComparison(const FilterPushdown::Config &config, const string
 
 static string WriteConjunction(const FilterPushdown::Config &config, const string &column_name,
                                const vector<unique_ptr<Expression>> &filters, const string &op) {
+	const bool is_or = op == "OR";
 	vector<string> filter_entries;
 	for (auto &filter : filters) {
 		auto new_filter = FilterPushdown::TransformFilterExpression(config, column_name, *filter);
 		if (new_filter.empty()) {
-			continue;
+			// An optional (advisory) filter wrapper may be dropped from an AND: it
+			// widens the SQL, never the result (the real predicate is enforced above
+			// the scan). Dropping anything from an OR narrows the result, and dropping
+			// a real AND conjunct widens the SQL past the filter -- both make the SQL
+			// lie, so the whole filter renders empty and stays local.
+			if (!is_or && ExpressionFilter::IsRootOptionalExpression(*filter)) {
+				continue;
+			}
+			return string();
 		}
 		filter_entries.push_back(std::move(new_filter));
 	}
@@ -281,8 +292,15 @@ static string TransformExpressionSubject(const FilterPushdown::Config &config, c
 		if (struct_type.id() != LogicalTypeId::STRUCT || StructType::IsUnnamed(struct_type)) {
 			return string();
 		}
-		auto child_name = query::QueryWriter::WriteQuotedAndEscaped(
-		    config.identifier_config, StructType::GetChildName(struct_type, child_idx).GetIdentifierName());
+		auto field = StructType::GetChildName(struct_type, child_idx).GetIdentifierName();
+		auto &identifier_config = config.identifier_config;
+		if (identifier_config.dialect == query::Dialect::ClickHouse) {
+			// ClickHouse addresses a Tuple field as tupleElement(col, 'name').
+			auto constant_config = query::QueryWriter::CreateConfig('\'', identifier_config.escape_style);
+			return "tupleElement(" + parent_name + ", " +
+			       query::QueryWriter::WriteQuotedAndEscaped(constant_config, field) + ")";
+		}
+		auto child_name = query::QueryWriter::WriteQuotedAndEscaped(identifier_config, field);
 		return "(" + parent_name + ")." + child_name;
 	}
 	default:
@@ -385,7 +403,9 @@ string FilterPushdown::TransformFilterExpression(const FilterPushdown::Config &c
 string FilterPushdown::TransformFilter(const FilterPushdown::Config &config, const string &column_name,
                                        const TableFilter &filter, column_t column_id) {
 	if (IsVirtualColumn(column_id)) {
-		return "FALSE";
+		// A rowid has no remote SQL identity; rendering anything (the old FALSE)
+		// makes the SQL narrower than the filter. Unrenderable -> stays local.
+		return string();
 	}
 	string column_name_quoted = query::QueryWriter::WriteQuotedAndEscaped(config.identifier_config, column_name);
 	auto &expr = FilterUtil::GetExpression(filter, "FilterPushdown::TransformFilter");
