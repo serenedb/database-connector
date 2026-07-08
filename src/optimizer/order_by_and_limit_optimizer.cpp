@@ -84,6 +84,11 @@ static string TraceColumnToGet(const OrderByAndLimitOptimizer::Config &config, E
 	if (actual_col_idx >= get.names.size()) {
 		return std::string();
 	}
+	if (config.order_key_unsafe && config.order_key_unsafe(get, actual_col_idx)) {
+		// The connector vetoed this key: the remote engine's ordering for its type
+		// diverges from DuckDB's, so a remote sort would return the wrong rows.
+		return std::string();
+	}
 	auto query_config = query::QueryWriter::CreateConfig(config.identifier_quote, config.escape_style);
 	return query::QueryWriter::WriteQuotedAndEscaped(query_config, get.names[actual_col_idx].GetIdentifierName());
 }
@@ -108,9 +113,14 @@ static string TryBuildOrderByClause(const OrderByAndLimitOptimizer::Config &conf
 			    (direction == OrderType::ASCENDING) ? OrderByNullType::NULLS_LAST : OrderByNullType::NULLS_FIRST;
 		}
 
+		// Emit an explicit IS [NOT] NULL prefix key for BOTH null placements instead
+		// of relying on the remote engine's default, which differs per engine (MySQL
+		// sorts NULLs first on ASC; Postgres and ClickHouse sort them last). A bare
+		// "col ASC" for NULLS FIRST returns the wrong rows on the latter two -- and
+		// since the fold removes the local sort node, nothing downstream corrects it.
 		if (direction == OrderType::ASCENDING) {
 			if (null_order == OrderByNullType::NULLS_FIRST) {
-				fragments.push_back(col_name + " ASC");
+				fragments.push_back(col_name + " IS NOT NULL, " + col_name + " ASC");
 			} else {
 				fragments.push_back(col_name + " IS NULL, " + col_name + " ASC");
 			}
@@ -118,7 +128,7 @@ static string TryBuildOrderByClause(const OrderByAndLimitOptimizer::Config &conf
 			if (null_order == OrderByNullType::NULLS_FIRST) {
 				fragments.push_back(col_name + " IS NOT NULL, " + col_name + " DESC");
 			} else {
-				fragments.push_back(col_name + " DESC");
+				fragments.push_back(col_name + " IS NULL, " + col_name + " DESC");
 			}
 		}
 	}
@@ -256,7 +266,8 @@ void OrderByAndLimitOptimizer::Optimize(const OrderByAndLimitOptimizer::Config &
 		auto &topn = op->Cast<LogicalTopN>();
 		LogicalGet *get = nullptr;
 		dbconnector::BindData *bind_data = nullptr;
-		if (OptimizerUtil::FindExtensionGet(config.table_scan_name, *op->children[0], get, bind_data)) {
+		if (OptimizerUtil::FindExtensionGet(config.table_scan_name, *op->children[0], get, bind_data) &&
+		    !(config.limit_unsafe && config.limit_unsafe(*get))) {
 			string order_clause = TryBuildOrderByClause(config, topn.orders, *op->children[0], *get);
 			if (!order_clause.empty()) {
 				auto &order_by_and_limit_bind_data = bind_data->GetOrderByAndLimitBindData();
@@ -313,6 +324,9 @@ void OrderByAndLimitOptimizer::Optimize(const OrderByAndLimitOptimizer::Config &
 		}
 		auto &get = child.get().Cast<LogicalGet>();
 		if (get.function.name != config.table_scan_name) {
+			return;
+		}
+		if (config.limit_unsafe && config.limit_unsafe(get)) {
 			return;
 		}
 		switch (limit.limit_val.Type()) {
