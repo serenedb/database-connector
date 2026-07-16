@@ -21,7 +21,8 @@ using namespace duckdb;
 
 OrderByAndLimitOptimizer::Config
 OrderByAndLimitOptimizer::CreateConfig(ClientContext &ctx, const std::string &enabled_option, char identifier_quote,
-                                       query::QuoteEscapeStyle escape_style, std::string table_scan_name) {
+                                       query::QuoteEscapeStyle escape_style, std::string table_scan_name,
+                                       query::Dialect dialect) {
 	Config res;
 
 	res.enabled = false;
@@ -33,32 +34,64 @@ OrderByAndLimitOptimizer::CreateConfig(ClientContext &ctx, const std::string &en
 	res.identifier_quote = identifier_quote;
 	res.escape_style = escape_style;
 	res.table_scan_name = std::move(table_scan_name);
+	res.dialect = dialect;
 
 	return res;
 }
 
-static string TraceColumnToGet(const OrderByAndLimitOptimizer::Config &config, Expression &expr, LogicalOperator &child,
-                               LogicalGet &get) {
+// Traces an ORDER BY key expression to a scan column; fills `quoted` (the
+// dialect-quoted column reference) and `type`. False when the key is not a
+// plain scan column.
+static bool TraceOrderKey(const OrderByAndLimitOptimizer::Config &config, Expression &expr, LogicalOperator &child,
+                          LogicalGet &get, string &quoted, LogicalType &type) {
 	if (expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
-		return std::string();
+		return false;
 	}
 	auto &col_ref = expr.Cast<BoundColumnRefExpression>();
 	if (col_ref.Depth() > 0) {
-		return std::string();
+		return false;
 	}
 	auto traced = OptimizerUtil::TraceBindingToColumn(col_ref.BindingMutable(), child, get);
 	if (!traced.Found()) {
-		return std::string();
-	}
-	auto &traced_bind_data = get.bind_data->Cast<dbconnector::BindData>();
-	const auto &unsafe_keys = traced_bind_data.GetOrderByAndLimitBindData().order_key_unsafe;
-	if (traced.col_idx < unsafe_keys.size() && unsafe_keys[traced.col_idx]) {
-		// The connector marked this column: the remote engine's ordering for its
-		// type diverges from DuckDB's, so a remote sort would return the wrong rows.
-		return std::string();
+		return false;
 	}
 	auto query_config = query::QueryWriter::CreateConfig(config.identifier_quote, config.escape_style);
-	return query::QueryWriter::WriteQuotedAndEscaped(query_config, traced.col_name);
+	quoted = query::QueryWriter::WriteQuotedAndEscaped(query_config, traced.col_name);
+	type = traced.col_type;
+	return true;
+}
+
+// True when `type` nests a scalar whose ClickHouse ordering diverges from
+// DuckDB's. A compound key compares field-wise on both sides, but a divergent
+// field cannot be rewritten inside a whole-value comparison (no per-field
+// isNaN/toString), so such keys stay local. VARCHAR fields are conservative:
+// an Enum surfaces as VARCHAR locally but sorts by ordinal remotely, and the
+// DuckDB type cannot tell the two apart.
+static bool CompoundContainsDivergent(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::UUID:
+	case LogicalTypeId::VARCHAR:
+		return true;
+	case LogicalTypeId::STRUCT: {
+		for (auto &child : StructType::GetChildTypes(type)) {
+			if (CompoundContainsDivergent(child.second)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	case LogicalTypeId::LIST:
+		return CompoundContainsDivergent(ListType::GetChildType(type));
+	case LogicalTypeId::ARRAY:
+		return CompoundContainsDivergent(ArrayType::GetChildType(type));
+	case LogicalTypeId::MAP:
+		return CompoundContainsDivergent(MapType::KeyType(type)) ||
+		       CompoundContainsDivergent(MapType::ValueType(type));
+	default:
+		return false;
+	}
 }
 
 static bool LimitFoldUnsafe(const OrderByAndLimitOptimizer::Config &config, const LogicalGet &get) {
@@ -79,8 +112,9 @@ static string TryBuildOrderByClause(const OrderByAndLimitOptimizer::Config &conf
                                     LogicalOperator &child, LogicalGet &get) {
 	vector<string> fragments;
 	for (auto &order : orders) {
-		string col_name = TraceColumnToGet(config, *order.expression, child, get);
-		if (col_name.empty()) {
+		string quoted;
+		LogicalType key_type;
+		if (!TraceOrderKey(config, *order.expression, child, get, quoted, key_type)) {
 			return std::string();
 		}
 
@@ -102,7 +136,53 @@ static string TryBuildOrderByClause(const OrderByAndLimitOptimizer::Config &conf
 		// since the fold removes the local sort node, nothing downstream corrects it.
 		const char *null_key = (null_order == OrderByNullType::NULLS_FIRST) ? " IS NOT NULL, " : " IS NULL, ";
 		const char *dir = (direction == OrderType::ASCENDING) ? " ASC" : " DESC";
-		fragments.push_back(col_name + null_key + col_name + dir);
+
+		// Rewrite the value key per dialect so the remote reproduces DuckDB's
+		// ordering (the NULLS prefix stays on the bare column):
+		//  - ClickHouse floats compare IEEE, leaving NaN unordered; DuckDB sorts
+		//    NaN above every number. An isNaN() prefix key in the key's own
+		//    direction pins NaN to the greatest position.
+		//  - ClickHouse text-backed columns (Enum labels, IPv4/6, JSON,
+		//    Decimal(>38)) surface locally as their toString() text, and UUIDs
+		//    sort by a half-swapped byte order: ordering by toString(col) matches
+		//    the local byte-wise order in every case (identity for plain String).
+		//  - Compound keys nesting a divergent scalar cannot be rewritten
+		//    field-wise -- the sort stays local.
+		//  - Postgres sorts text by locale collation; DuckDB compares bytes, so
+		//    the key gets COLLATE "C". Its floats/UUIDs already match DuckDB.
+		string value_key = quoted;
+		string nan_key;
+		switch (config.dialect) {
+		case query::Dialect::ClickHouse:
+			switch (key_type.id()) {
+			case LogicalTypeId::FLOAT:
+			case LogicalTypeId::DOUBLE:
+				nan_key = "isNaN(" + quoted + ")" + dir + ", ";
+				break;
+			case LogicalTypeId::VARCHAR:
+			case LogicalTypeId::UUID:
+				value_key = "toString(" + quoted + ")";
+				break;
+			case LogicalTypeId::STRUCT:
+			case LogicalTypeId::LIST:
+			case LogicalTypeId::ARRAY:
+			case LogicalTypeId::MAP:
+				if (CompoundContainsDivergent(key_type)) {
+					return std::string();
+				}
+				break;
+			default:
+				break;
+			}
+			break;
+		case query::Dialect::Postgres:
+			if (key_type.id() == LogicalTypeId::VARCHAR) {
+				value_key = quoted + " COLLATE \"C\"";
+			}
+			break;
+		}
+
+		fragments.push_back(quoted + null_key + nan_key + value_key + dir);
 	}
 	return " ORDER BY " + StringUtil::Join(fragments, ", ");
 }
