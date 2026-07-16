@@ -26,23 +26,18 @@ public:
 	                           const std::string &blob_literal_suffix = std::string(),
 	                           query::Dialect dialect = query::Dialect::Postgres);
 
-	struct RenderedFilter {
-		std::string sql;
-		//! False when `sql` is WIDER than the filter: an AND conjunct could not be
-		//! rendered and was dropped, so the remote returns a SUPERSET and the caller
-		//! must re-apply the full filter locally. An OR with an unrenderable branch
-		//! never widens -- the whole disjunction renders empty instead (a partial OR
-		//! would be a wrong subset).
-		bool exact = true;
-	};
-	static RenderedFilter TransformFilter(const Config &config, const std::string &column_name,
-	                                      const duckdb::TableFilter &filter, duckdb::column_t column_id);
+	//! All-or-nothing: returns SQL equivalent to the filter, or an empty string
+	//! when any required piece cannot be rendered (the filter must then be
+	//! applied locally). Only optional (advisory) pieces may be dropped from
+	//! the rendered SQL -- correctness never depends on them.
+	static std::string TransformFilter(const Config &config, const std::string &column_name,
+	                                   const duckdb::TableFilter &filter, duckdb::column_t column_id);
 
 private:
 	static std::string TransformExpression(const query::QueryWriter::Config &identifier_config,
 	                                       const query::QueryWriter::Config &constant_config,
 	                                       const std::string &column_name, const duckdb::Expression &expr,
-	                                       duckdb::column_t column_id, bool &exact);
+	                                       duckdb::column_t column_id);
 	static std::string TransformExpressionSubject(const query::QueryWriter::Config &identifier_config,
 	                                              const std::string &column_name, const duckdb::Expression &expr);
 	static std::string TransformConstantFilter(const query::QueryWriter::Config &constant_config,
@@ -53,7 +48,7 @@ private:
 	                                    const query::QueryWriter::Config &constant_config,
 	                                    const std::string &column_name,
 	                                    const duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> &filters,
-	                                    const std::string &op, duckdb::column_t column_id, bool &exact);
+	                                    const std::string &op, duckdb::column_t column_id);
 };
 
 } // namespace table_scan
