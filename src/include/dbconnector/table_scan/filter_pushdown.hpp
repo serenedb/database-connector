@@ -12,12 +12,8 @@ namespace table_scan {
 
 class FilterPushdown {
 	struct Config {
-		char identifier_quote = '"';
-		char constant_quote = '\'';
-		query::QuoteEscapeStyle escape_style = query::QuoteEscapeStyle::DOUBLE_QUOTE;
-		std::string blob_literal_prefix;
-		std::string blob_literal_suffix;
-		query::Dialect dialect = query::Dialect::Postgres;
+		query::QueryWriter::Config identifier;
+		query::QueryWriter::Config constant;
 	};
 
 public:

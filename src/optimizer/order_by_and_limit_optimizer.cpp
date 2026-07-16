@@ -46,54 +46,19 @@ static string TraceColumnToGet(const OrderByAndLimitOptimizer::Config &config, E
 	if (col_ref.Depth() > 0) {
 		return std::string();
 	}
-	auto binding = col_ref.BindingMutable();
-
-	reference<LogicalOperator> current = child;
-	while (current.get().type == LogicalOperatorType::LOGICAL_PROJECTION) {
-		auto &proj = current.get().Cast<LogicalProjection>();
-		if (binding.table_index != proj.table_index) {
-			break;
-		}
-		if (binding.column_index >= proj.expressions.size()) {
-			return std::string();
-		}
-		auto &proj_expr = *proj.expressions[binding.column_index];
-		if (proj_expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
-			return std::string();
-		}
-		auto &inner_ref = proj_expr.Cast<BoundColumnRefExpression>();
-		if (inner_ref.Depth() > 0) {
-			return std::string();
-		}
-		binding = inner_ref.BindingMutable();
-		current = *current.get().children[0];
-	}
-
-	if (binding.table_index != get.table_index) {
-		return std::string();
-	}
-	auto &column_ids = get.GetColumnIds();
-	if (binding.column_index >= column_ids.size()) {
-		return std::string();
-	}
-	auto &col_index = column_ids[binding.column_index];
-	if (col_index.IsRowIdColumn()) {
-		return std::string();
-	}
-
-	auto actual_col_idx = col_index.GetPrimaryIndex();
-	if (actual_col_idx >= get.names.size()) {
+	auto traced = OptimizerUtil::TraceBindingToColumn(col_ref.BindingMutable(), child, get);
+	if (!traced.Found()) {
 		return std::string();
 	}
 	auto &traced_bind_data = get.bind_data->Cast<dbconnector::BindData>();
 	const auto &unsafe_keys = traced_bind_data.GetOrderByAndLimitBindData().order_key_unsafe;
-	if (actual_col_idx < unsafe_keys.size() && unsafe_keys[actual_col_idx]) {
+	if (traced.col_idx < unsafe_keys.size() && unsafe_keys[traced.col_idx]) {
 		// The connector marked this column: the remote engine's ordering for its
 		// type diverges from DuckDB's, so a remote sort would return the wrong rows.
 		return std::string();
 	}
 	auto query_config = query::QueryWriter::CreateConfig(config.identifier_quote, config.escape_style);
-	return query::QueryWriter::WriteQuotedAndEscaped(query_config, get.names[actual_col_idx].GetIdentifierName());
+	return query::QueryWriter::WriteQuotedAndEscaped(query_config, traced.col_name);
 }
 
 static bool LimitFoldUnsafe(const OrderByAndLimitOptimizer::Config &config, const LogicalGet &get) {
@@ -135,19 +100,9 @@ static string TryBuildOrderByClause(const OrderByAndLimitOptimizer::Config &conf
 		// sorts NULLs first on ASC; Postgres and ClickHouse sort them last). A bare
 		// "col ASC" for NULLS FIRST returns the wrong rows on the latter two -- and
 		// since the fold removes the local sort node, nothing downstream corrects it.
-		if (direction == OrderType::ASCENDING) {
-			if (null_order == OrderByNullType::NULLS_FIRST) {
-				fragments.push_back(col_name + " IS NOT NULL, " + col_name + " ASC");
-			} else {
-				fragments.push_back(col_name + " IS NULL, " + col_name + " ASC");
-			}
-		} else {
-			if (null_order == OrderByNullType::NULLS_FIRST) {
-				fragments.push_back(col_name + " IS NOT NULL, " + col_name + " DESC");
-			} else {
-				fragments.push_back(col_name + " IS NULL, " + col_name + " DESC");
-			}
-		}
+		const char *null_key = (null_order == OrderByNullType::NULLS_FIRST) ? " IS NOT NULL, " : " IS NULL, ";
+		const char *dir = (direction == OrderType::ASCENDING) ? " ASC" : " DESC";
+		fragments.push_back(col_name + null_key + col_name + dir);
 	}
 	return " ORDER BY " + StringUtil::Join(fragments, ", ");
 }
@@ -328,18 +283,10 @@ void OrderByAndLimitOptimizer::Optimize(const OrderByAndLimitOptimizer::Config &
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_LIMIT) {
 		auto &limit = op->Cast<LogicalLimit>();
-		reference<LogicalOperator> child = *op->children[0];
-		while (child.get().type == LogicalOperatorType::LOGICAL_PROJECTION) {
-			child = *child.get().children[0];
-		}
-		if (child.get().type != LogicalOperatorType::LOGICAL_GET) {
-			return;
-		}
-		auto &get = child.get().Cast<LogicalGet>();
-		if (get.function.name != config.table_scan_name) {
-			return;
-		}
-		if (LimitFoldUnsafe(config, get)) {
+		LogicalGet *get = nullptr;
+		dbconnector::BindData *bind_data = nullptr;
+		if (!OptimizerUtil::FindExtensionGet(config.table_scan_name, *op->children[0], get, bind_data) ||
+		    LimitFoldUnsafe(config, *get)) {
 			return;
 		}
 		switch (limit.limit_val.Type()) {
@@ -356,8 +303,7 @@ void OrderByAndLimitOptimizer::Optimize(const OrderByAndLimitOptimizer::Config &
 		default:
 			return;
 		}
-		auto &bind_data = get.bind_data->Cast<dbconnector::BindData>();
-		auto &order_by_and_limit_bind_data = bind_data.GetOrderByAndLimitBindData();
+		auto &order_by_and_limit_bind_data = bind_data->GetOrderByAndLimitBindData();
 		if (!order_by_and_limit_bind_data.limit_clause.empty()) {
 			return;
 		}

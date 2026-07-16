@@ -25,12 +25,10 @@ FilterPushdown::Config FilterPushdown::CreateConfig(char identifier_quote, char 
                                                     const std::string &blob_literal_prefix,
                                                     const std::string &blob_literal_suffix, query::Dialect dialect) {
 	Config res;
-	res.identifier_quote = identifier_quote;
-	res.constant_quote = constant_quote;
-	res.escape_style = escape_style;
-	res.blob_literal_prefix = blob_literal_prefix;
-	res.blob_literal_suffix = blob_literal_suffix;
-	res.dialect = dialect;
+	res.identifier =
+	    query::QueryWriter::CreateConfig(identifier_quote, escape_style, std::string(), std::string(), dialect);
+	res.constant =
+	    query::QueryWriter::CreateConfig(constant_quote, escape_style, blob_literal_prefix, blob_literal_suffix, dialect);
 	return res;
 }
 
@@ -143,9 +141,7 @@ string FilterPushdown::TransformExpressionSubject(const query::QueryWriter::Conf
 		auto field = StructType::GetChildName(struct_type, child_idx).GetIdentifierName();
 		if (identifier_config.dialect == query::Dialect::ClickHouse) {
 			// ClickHouse addresses a Tuple field as tupleElement(col, 'name').
-			auto constant_config = query::QueryWriter::CreateConfig('\'', identifier_config.escape_style,
-			                                                        std::string(), std::string(),
-			                                                        identifier_config.dialect);
+			auto constant_config = query::QueryWriter::CreateConfig('\'', identifier_config.escape_style);
 			return "tupleElement(" + parent_name + ", " +
 			       query::QueryWriter::WriteQuotedAndEscaped(constant_config, field) + ")";
 		}
@@ -236,22 +232,17 @@ std::string FilterPushdown::TransformExpression(const query::QueryWriter::Config
 	}
 	case ExpressionClass::BOUND_FUNCTION: {
 		auto &func = expr.Cast<BoundFunctionExpression>();
-		if (func.Function().GetName() == OptionalFilterScalarFun::NAME && func.BindInfo()) {
-			auto &data = func.BindInfo()->Cast<OptionalFilterFunctionData>();
-			return data.child_filter_expr ? TransformExpression(identifier_config, constant_config, column_name,
-			                                                    *data.child_filter_expr, column_id)
-			                              : std::string();
+		auto &name = func.Function().GetName();
+		optional_ptr<const Expression> child;
+		if (func.BindInfo() && name == OptionalFilterScalarFun::NAME) {
+			child = func.BindInfo()->Cast<OptionalFilterFunctionData>().child_filter_expr.get();
+		} else if (func.BindInfo() && name == SelectivityOptionalFilterScalarFun::NAME) {
+			child = func.BindInfo()->Cast<SelectivityOptionalFilterFunctionData>().child_filter_expr.get();
 		}
-		if (func.Function().GetName() == SelectivityOptionalFilterScalarFun::NAME && func.BindInfo()) {
-			auto &data = func.BindInfo()->Cast<SelectivityOptionalFilterFunctionData>();
-			return data.child_filter_expr ? TransformExpression(identifier_config, constant_config, column_name,
-			                                                    *data.child_filter_expr, column_id)
-			                              : std::string();
-		}
-		if (func.Function().GetName() == DynamicFilterScalarFun::NAME) {
+		if (!child) {
 			return std::string();
 		}
-		return std::string();
+		return TransformExpression(identifier_config, constant_config, column_name, *child, column_id);
 	}
 	default:
 		return std::string();
@@ -260,15 +251,9 @@ std::string FilterPushdown::TransformExpression(const query::QueryWriter::Config
 
 std::string FilterPushdown::TransformFilter(const FilterPushdown::Config &config, const std::string &column_name,
                                             const TableFilter &filter, column_t column_id) {
-	auto identifier_config =
-	    query::QueryWriter::CreateConfig(config.identifier_quote, config.escape_style, std::string(), std::string(),
-	                                     config.dialect);
-	auto constant_config = query::QueryWriter::CreateConfig(
-	    config.constant_quote, config.escape_style, config.blob_literal_prefix, config.blob_literal_suffix,
-	    config.dialect);
-	std::string column_name_quoted = query::QueryWriter::WriteQuotedAndEscaped(identifier_config, column_name);
+	std::string column_name_quoted = query::QueryWriter::WriteQuotedAndEscaped(config.identifier, column_name);
 	auto &expr = FilterUtil::GetExpression(filter, "FilterPushdown::TransformFilter");
-	return TransformExpression(identifier_config, constant_config, column_name_quoted, expr, column_id);
+	return TransformExpression(config.identifier, config.constant, column_name_quoted, expr, column_id);
 }
 
 } // namespace table_scan
