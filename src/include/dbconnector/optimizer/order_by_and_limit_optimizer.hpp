@@ -26,7 +26,7 @@ public:
 
 	static Config CreateConfig(duckdb::ClientContext &ctx, const std::string &enabled_option, char identifier_quote,
 	                           query::QuoteEscapeStyle escape_style, std::string table_scan_name,
-	                           query::Dialect dialect = query::Dialect::Postgres);
+	                           query::Dialect dialect);
 
 	static void Optimize(const Config &config, duckdb::OptimizerExtensionInput &input,
 	                     duckdb::unique_ptr<duckdb::LogicalOperator> &op);

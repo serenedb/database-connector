@@ -23,9 +23,9 @@ using namespace duckdb;
 
 FilterPushdown::Config
 FilterPushdown::CreateConfig(char identifier_quote, char constant_quote, query::QuoteEscapeStyle escape_style,
-                             const string &blob_literal_prefix, const string &blob_literal_suffix,
-                             const std::string &varchar_comparison_collation, write_distinct_from_t write_distinct_from,
-                             get_constant_range_t get_constant_range, query::Dialect dialect) {
+                             query::Dialect dialect, const string &blob_literal_prefix,
+                             const string &blob_literal_suffix, const std::string &varchar_comparison_collation,
+                             write_distinct_from_t write_distinct_from, get_constant_range_t get_constant_range) {
 	Config res;
 	res.identifier_config =
 	    query::QueryWriter::CreateConfig(identifier_quote, escape_style, std::string(), std::string(), dialect);
