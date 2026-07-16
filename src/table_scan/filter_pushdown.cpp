@@ -34,25 +34,31 @@ FilterPushdown::Config FilterPushdown::CreateConfig(char identifier_quote, char 
 	return res;
 }
 
+static bool IsOptionalFilterExpression(const Expression &expr) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return false;
+	}
+	auto &name = expr.Cast<BoundFunctionExpression>().Function().GetName();
+	return name == OptionalFilterScalarFun::NAME || name == SelectivityOptionalFilterScalarFun::NAME ||
+	       name == DynamicFilterScalarFun::NAME;
+}
+
 std::string FilterPushdown::CreateExpression(const query::QueryWriter::Config &identifier_config,
                                              const query::QueryWriter::Config &constant_config,
                                              const std::string &column_name,
                                              const vector<unique_ptr<Expression>> &filters, const std::string &op,
-                                             column_t column_id, bool &exact) {
-	const bool is_or = op == "OR";
+                                             column_t column_id) {
 	vector<std::string> filter_entries;
 	for (auto &filter : filters) {
-		auto new_filter =
-		    TransformExpression(identifier_config, constant_config, column_name, *filter, column_id, exact);
+		auto new_filter = TransformExpression(identifier_config, constant_config, column_name, *filter, column_id);
 		if (new_filter.empty()) {
-			// Dropping an OR branch would push a wrong subset -> the whole
-			// disjunction stays local. Dropping an AND conjunct pushes a
-			// superset the caller must re-apply locally.
-			if (is_or) {
-				return std::string();
+			// Optional (advisory) pieces may be dropped from the SQL; dropping a
+			// required piece would make the SQL wider (AND) or narrower (OR) than
+			// the filter, so the whole filter renders empty and stays local.
+			if (IsOptionalFilterExpression(*filter)) {
+				continue;
 			}
-			exact = false;
-			continue;
+			return std::string();
 		}
 		filter_entries.push_back(std::move(new_filter));
 	}
@@ -151,7 +157,7 @@ string FilterPushdown::TransformExpressionSubject(const query::QueryWriter::Conf
 std::string FilterPushdown::TransformExpression(const query::QueryWriter::Config &identifier_config,
                                                 const query::QueryWriter::Config &constant_config,
                                                 const std::string &column_name, const Expression &expr,
-                                                column_t column_id, bool &exact) {
+                                                column_t column_id) {
 	if (BoundComparisonExpression::IsComparison(expr)) {
 		auto &comparison = expr.Cast<BoundFunctionExpression>();
 		auto comparison_type = comparison.GetExpressionType();
@@ -180,10 +186,10 @@ std::string FilterPushdown::TransformExpression(const query::QueryWriter::Config
 		switch (conjunction.GetExpressionType()) {
 		case ExpressionType::CONJUNCTION_AND:
 			return CreateExpression(identifier_config, constant_config, column_name, conjunction.GetChildren(), "AND",
-			                        column_id, exact);
+			                        column_id);
 		case ExpressionType::CONJUNCTION_OR:
 			return CreateExpression(identifier_config, constant_config, column_name, conjunction.GetChildren(), "OR",
-			                        column_id, exact);
+			                        column_id);
 		default:
 			return std::string();
 		}
@@ -234,13 +240,13 @@ std::string FilterPushdown::TransformExpression(const query::QueryWriter::Config
 		if (func.Function().GetName() == OptionalFilterScalarFun::NAME && func.BindInfo()) {
 			auto &data = func.BindInfo()->Cast<OptionalFilterFunctionData>();
 			return data.child_filter_expr ? TransformExpression(identifier_config, constant_config, column_name,
-			                                                    *data.child_filter_expr, column_id, exact)
+			                                                    *data.child_filter_expr, column_id)
 			                              : std::string();
 		}
 		if (func.Function().GetName() == SelectivityOptionalFilterScalarFun::NAME && func.BindInfo()) {
 			auto &data = func.BindInfo()->Cast<SelectivityOptionalFilterFunctionData>();
 			return data.child_filter_expr ? TransformExpression(identifier_config, constant_config, column_name,
-			                                                    *data.child_filter_expr, column_id, exact)
+			                                                    *data.child_filter_expr, column_id)
 			                              : std::string();
 		}
 		if (func.Function().GetName() == DynamicFilterScalarFun::NAME) {
@@ -253,9 +259,8 @@ std::string FilterPushdown::TransformExpression(const query::QueryWriter::Config
 	}
 }
 
-FilterPushdown::RenderedFilter FilterPushdown::TransformFilter(const FilterPushdown::Config &config,
-                                                               const std::string &column_name,
-                                                               const TableFilter &filter, column_t column_id) {
+std::string FilterPushdown::TransformFilter(const FilterPushdown::Config &config, const std::string &column_name,
+                                            const TableFilter &filter, column_t column_id) {
 	auto identifier_config =
 	    query::QueryWriter::CreateConfig(config.identifier_quote, config.escape_style, std::string(), std::string(),
 	                                     config.dialect);
@@ -264,10 +269,7 @@ FilterPushdown::RenderedFilter FilterPushdown::TransformFilter(const FilterPushd
 	    config.dialect);
 	std::string column_name_quoted = query::QueryWriter::WriteQuotedAndEscaped(identifier_config, column_name);
 	auto &expr = FilterUtil::GetExpression(filter, "FilterPushdown::TransformFilter");
-	RenderedFilter result;
-	result.sql =
-	    TransformExpression(identifier_config, constant_config, column_name_quoted, expr, column_id, result.exact);
-	return result;
+	return TransformExpression(identifier_config, constant_config, column_name_quoted, expr, column_id);
 }
 
 } // namespace table_scan
