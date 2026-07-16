@@ -296,8 +296,7 @@ static string TransformExpressionSubject(const FilterPushdown::Config &config, c
 		auto &identifier_config = config.identifier_config;
 		if (identifier_config.dialect == query::Dialect::ClickHouse) {
 			// ClickHouse addresses a Tuple field as tupleElement(col, 'name').
-			auto constant_config = query::QueryWriter::CreateConfig('\'', identifier_config.escape_style, std::string(),
-			                                                        std::string(), identifier_config.dialect);
+			auto constant_config = query::QueryWriter::CreateConfig('\'', identifier_config.escape_style);
 			return "tupleElement(" + parent_name + ", " +
 			       query::QueryWriter::WriteQuotedAndEscaped(constant_config, field) + ")";
 		}

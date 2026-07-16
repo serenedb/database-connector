@@ -4,7 +4,6 @@
 
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
 
 #include "dbconnector/query/query_writer.hpp"
 
