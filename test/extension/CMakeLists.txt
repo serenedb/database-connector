@@ -13,6 +13,7 @@ if(NOT DEFINED ENV{DUCKDB_SRC_PATH})
 endif()
 
 add_executable(${PROJECT_NAME}
+    ../../src/optimizer/aggregate_optimizer.cpp
     ../../src/optimizer/optimizer_util.cpp
     ../../src/optimizer/order_by_and_limit_optimizer.cpp
     ../../src/query/query_writer.cpp
