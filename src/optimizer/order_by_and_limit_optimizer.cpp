@@ -92,11 +92,16 @@ static bool CompoundContainsDivergent(const LogicalType &type) {
 }
 
 static bool LimitFoldUnsafe(const OrderByAndLimitOptimizer::Config &config, const LogicalGet &get) {
-	if (config.fold_limit_with_table_filters) {
+	// Postgres filter pushdown is exact-or-error: every required filter runs in
+	// the remote statement, WHERE before LIMIT, so folding is always safe. Other
+	// engines' comparison semantics (ClickHouse: NaN, Enum ordinals, literals
+	// parsed in the server time zone) force connectors to keep some required
+	// filters local and re-apply them AFTER the fetch -- a folded LIMIT would
+	// truncate the stream before that re-check and drop qualifying rows.
+	// Optional (advisory) filters never change the row set and do not block.
+	if (config.dialect == query::Dialect::Postgres) {
 		return false;
 	}
-	// The connector re-applies non-optional table filters locally: a remote LIMIT
-	// would truncate the stream before that re-check and drop qualifying rows.
 	for (auto &entry : get.table_filters) {
 		if (!ExpressionFilter::IsOptionalFilter(entry.Filter())) {
 			return true;

@@ -17,15 +17,10 @@ public:
 		char identifier_quote = '"';
 		query::QuoteEscapeStyle escape_style = query::QuoteEscapeStyle::DOUBLE_QUOTE;
 		std::string table_scan_name;
-		//! False when the connector may re-apply the scan's table filters locally
-		//! (inexact remote pushdown): folding LIMIT/TOP_N would then truncate the
-		//! stream BEFORE the local re-check and drop rows that belong in the result.
-		//! A filterless scan still folds either way, and a pure ORDER BY fold is
-		//! unaffected (local filtering preserves the row order). True = always fold
-		//! (exact-pushdown engines, the legacy behaviour).
-		bool fold_limit_with_table_filters = true;
 		//! Selects the per-type ORDER-key rewrites that make the remote sort
-		//! reproduce DuckDB's ordering (see TryBuildOrderByClause).
+		//! reproduce DuckDB's ordering (see TryBuildOrderByClause), and whether
+		//! LIMIT-bearing folds are allowed over filtered scans (see
+		//! LimitFoldUnsafe).
 		query::Dialect dialect = query::Dialect::Postgres;
 	};
 
