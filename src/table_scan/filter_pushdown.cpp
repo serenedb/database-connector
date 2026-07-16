@@ -21,9 +21,9 @@ namespace table_scan {
 using namespace duckdb;
 
 FilterPushdown::Config FilterPushdown::CreateConfig(char identifier_quote, char constant_quote,
-                                                    query::QuoteEscapeStyle escape_style,
+                                                    query::QuoteEscapeStyle escape_style, query::Dialect dialect,
                                                     const std::string &blob_literal_prefix,
-                                                    const std::string &blob_literal_suffix, query::Dialect dialect) {
+                                                    const std::string &blob_literal_suffix) {
 	Config res;
 	res.identifier =
 	    query::QueryWriter::CreateConfig(identifier_quote, escape_style, std::string(), std::string(), dialect);

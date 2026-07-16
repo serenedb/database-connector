@@ -39,9 +39,8 @@ OrderByAndLimitOptimizer::CreateConfig(ClientContext &ctx, const std::string &en
 	return res;
 }
 
-// Traces an ORDER BY key expression to a scan column; fills `quoted` (the
-// dialect-quoted column reference) and `type`. False when the key is not a
-// plain scan column.
+// Traces an ORDER BY key expression to a scan column; false when the key is
+// not a plain scan column.
 static bool TraceOrderKey(const OrderByAndLimitOptimizer::Config &config, Expression &expr, LogicalOperator &child,
                           LogicalGet &get, string &quoted, LogicalType &type) {
 	if (expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
@@ -62,11 +61,9 @@ static bool TraceOrderKey(const OrderByAndLimitOptimizer::Config &config, Expres
 }
 
 // True when `type` nests a scalar whose ClickHouse ordering diverges from
-// DuckDB's. A compound key compares field-wise on both sides, but a divergent
-// field cannot be rewritten inside a whole-value comparison (no per-field
-// isNaN/toString), so such keys stay local. VARCHAR fields are conservative:
-// an Enum surfaces as VARCHAR locally but sorts by ordinal remotely, and the
-// DuckDB type cannot tell the two apart.
+// DuckDB's: a divergent field cannot be rewritten inside a whole-value
+// comparison, so such keys stay local. VARCHAR is included because an Enum
+// (ordinal order remotely) is indistinguishable from a plain String here.
 static bool CompoundContainsDivergent(const LogicalType &type) {
 	switch (type.id()) {
 	case LogicalTypeId::FLOAT:
@@ -142,18 +139,11 @@ static string TryBuildOrderByClause(const OrderByAndLimitOptimizer::Config &conf
 		const char *dir = (direction == OrderType::ASCENDING) ? " ASC" : " DESC";
 
 		// Rewrite the value key per dialect so the remote reproduces DuckDB's
-		// ordering (the NULLS prefix stays on the bare column):
-		//  - ClickHouse floats compare IEEE, leaving NaN unordered; DuckDB sorts
-		//    NaN above every number. An isNaN() prefix key in the key's own
-		//    direction pins NaN to the greatest position.
-		//  - ClickHouse text-backed columns (Enum labels, IPv4/6, JSON,
-		//    Decimal(>38)) surface locally as their toString() text, and UUIDs
-		//    sort by a half-swapped byte order: ordering by toString(col) matches
-		//    the local byte-wise order in every case (identity for plain String).
-		//  - Compound keys nesting a divergent scalar cannot be rewritten
-		//    field-wise -- the sort stays local.
-		//  - Postgres sorts text by locale collation; DuckDB compares bytes, so
-		//    the key gets COLLATE "C". Its floats/UUIDs already match DuckDB.
+		// ordering: an isNaN() prefix pins NaN to the greatest position (CH
+		// compares IEEE); toString() restores byte-wise text order for CH's
+		// text-backed columns and half-swapped UUIDs (the connector surfaces
+		// those AS their toString() text, so the orders match by construction);
+		// COLLATE "C" replaces postgres' locale collation with byte order.
 		string value_key = quoted;
 		string nan_key;
 		switch (config.dialect) {
