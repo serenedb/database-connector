@@ -195,13 +195,15 @@ static PushedAggregate TryPushAggregateToMySQL(const AggregateOptimizer::Config 
 			auto scan_config = table_scan::FilterPushdown::CreateConfig('`', '\'', config.escape_style);
 			auto new_filter = table_scan::FilterPushdown::TransformFilter(scan_config, column_name.GetIdentifierName(),
 			                                                              entry.Filter(), table_col_idx);
-			if (new_filter.empty()) {
+			if (new_filter.sql.empty() || !new_filter.exact) {
+				// An inexact WHERE under a remote aggregate returns wrong numbers;
+				// there is no local re-check once the rows are aggregated away.
 				return res;
 			}
 			if (!where_clause.empty()) {
 				where_clause += " AND ";
 			}
-			where_clause += new_filter;
+			where_clause += new_filter.sql;
 		}
 		if (!where_clause.empty()) {
 			res.where_clause = where_clause;

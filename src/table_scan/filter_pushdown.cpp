@@ -38,22 +38,20 @@ std::string FilterPushdown::CreateExpression(const query::QueryWriter::Config &i
                                              const query::QueryWriter::Config &constant_config,
                                              const std::string &column_name,
                                              const vector<unique_ptr<Expression>> &filters, const std::string &op,
-                                             column_t column_id, bool *exact) {
+                                             column_t column_id, bool &exact) {
 	const bool is_or = op == "OR";
 	vector<std::string> filter_entries;
 	for (auto &filter : filters) {
 		auto new_filter =
 		    TransformExpression(identifier_config, constant_config, column_name, *filter, column_id, exact);
 		if (new_filter.empty()) {
-			if (exact) {
-				// Dropping an OR branch would push a wrong subset -> the whole
-				// disjunction stays local. Dropping an AND conjunct pushes a
-				// superset the caller must re-apply locally.
-				if (is_or) {
-					return std::string();
-				}
-				*exact = false;
+			// Dropping an OR branch would push a wrong subset -> the whole
+			// disjunction stays local. Dropping an AND conjunct pushes a
+			// superset the caller must re-apply locally.
+			if (is_or) {
+				return std::string();
 			}
+			exact = false;
 			continue;
 		}
 		filter_entries.push_back(std::move(new_filter));
@@ -153,7 +151,7 @@ string FilterPushdown::TransformExpressionSubject(const query::QueryWriter::Conf
 std::string FilterPushdown::TransformExpression(const query::QueryWriter::Config &identifier_config,
                                                 const query::QueryWriter::Config &constant_config,
                                                 const std::string &column_name, const Expression &expr,
-                                                column_t column_id, bool *exact) {
+                                                column_t column_id, bool &exact) {
 	if (BoundComparisonExpression::IsComparison(expr)) {
 		auto &comparison = expr.Cast<BoundFunctionExpression>();
 		auto comparison_type = comparison.GetExpressionType();
@@ -255,8 +253,9 @@ std::string FilterPushdown::TransformExpression(const query::QueryWriter::Config
 	}
 }
 
-std::string FilterPushdown::TransformFilter(const FilterPushdown::Config &config, const std::string &column_name,
-                                            const TableFilter &filter, column_t column_id, bool *exact) {
+FilterPushdown::RenderedFilter FilterPushdown::TransformFilter(const FilterPushdown::Config &config,
+                                                               const std::string &column_name,
+                                                               const TableFilter &filter, column_t column_id) {
 	auto identifier_config =
 	    query::QueryWriter::CreateConfig(config.identifier_quote, config.escape_style, std::string(), std::string(),
 	                                     config.dialect);
@@ -265,7 +264,10 @@ std::string FilterPushdown::TransformFilter(const FilterPushdown::Config &config
 	    config.dialect);
 	std::string column_name_quoted = query::QueryWriter::WriteQuotedAndEscaped(identifier_config, column_name);
 	auto &expr = FilterUtil::GetExpression(filter, "FilterPushdown::TransformFilter");
-	return TransformExpression(identifier_config, constant_config, column_name_quoted, expr, column_id, exact);
+	RenderedFilter result;
+	result.sql =
+	    TransformExpression(identifier_config, constant_config, column_name_quoted, expr, column_id, result.exact);
+	return result;
 }
 
 } // namespace table_scan
