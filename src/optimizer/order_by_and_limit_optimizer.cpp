@@ -197,12 +197,15 @@ static void PruneProjectionLayer(LogicalProjection &proj, const unordered_set<id
 }
 
 static void PruneColumnsAfterOrderByRemoval(LogicalOperator &child, LogicalGet &get,
-                                            const vector<idx_t> &projection_map) {
+                                            const vector<ProjectionIndex> &projection_map) {
 	if (child.type == LogicalOperatorType::LOGICAL_GET) {
-		auto &column_ids = get.GetColumnIds();
+		// projection_map entries are positions in the child's OUTPUT; resolve them
+		// through the bindings (which honor projection_ids) instead of indexing
+		// column_ids positionally -- the two spaces differ on non-identity scans.
+		auto bindings = get.GetColumnBindings();
 		vector<ColumnIndex> new_ids;
-		for (auto idx : projection_map) {
-			new_ids.push_back(column_ids[idx]);
+		for (auto pos : projection_map) {
+			new_ids.push_back(get.GetColumnIndex(bindings[pos]));
 		}
 		get.SetColumnIds(std::move(new_ids));
 		get.projection_ids.clear();
@@ -312,14 +315,7 @@ void OrderByAndLimitOptimizer::Optimize(const OrderByAndLimitOptimizer::Config &
 				auto &order_by_and_limit_bind_data = bind_data->GetOrderByAndLimitBindData();
 				order_by_and_limit_bind_data.order_by_clause = order_clause;
 				if (!order.projection_map.empty()) {
-					vector<column_t> indices;
-					indices.reserve(order.projection_map.size());
-					for (auto proj_idx : order.projection_map) {
-						ColumnIndex col_idx = get->GetColumnIndex(proj_idx);
-						column_t table_col_idx = col_idx.GetPrimaryIndex();
-						indices.emplace_back(table_col_idx);
-					}
-					PruneColumnsAfterOrderByRemoval(*op->children[0], *get, indices);
+					PruneColumnsAfterOrderByRemoval(*op->children[0], *get, order.projection_map);
 				}
 				op = std::move(op->children[0]);
 				return;
