@@ -8,6 +8,7 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 
 #include "dbconnector/bind_data.hpp"
 #include "dbconnector/optimizer/optimizer_util.hpp"
@@ -84,13 +85,29 @@ static string TraceColumnToGet(const OrderByAndLimitOptimizer::Config &config, E
 	if (actual_col_idx >= get.names.size()) {
 		return std::string();
 	}
-	if (config.order_key_unsafe && config.order_key_unsafe(get, actual_col_idx)) {
-		// The connector vetoed this key: the remote engine's ordering for its type
-		// diverges from DuckDB's, so a remote sort would return the wrong rows.
+	auto &traced_bind_data = get.bind_data->Cast<dbconnector::BindData>();
+	const auto &unsafe_keys = traced_bind_data.GetOrderByAndLimitBindData().order_key_unsafe;
+	if (actual_col_idx < unsafe_keys.size() && unsafe_keys[actual_col_idx]) {
+		// The connector marked this column: the remote engine's ordering for its
+		// type diverges from DuckDB's, so a remote sort would return the wrong rows.
 		return std::string();
 	}
 	auto query_config = query::QueryWriter::CreateConfig(config.identifier_quote, config.escape_style);
 	return query::QueryWriter::WriteQuotedAndEscaped(query_config, get.names[actual_col_idx].GetIdentifierName());
+}
+
+static bool LimitFoldUnsafe(const OrderByAndLimitOptimizer::Config &config, const LogicalGet &get) {
+	if (config.fold_limit_with_table_filters) {
+		return false;
+	}
+	// The connector re-applies non-optional table filters locally: a remote LIMIT
+	// would truncate the stream before that re-check and drop qualifying rows.
+	for (auto &entry : get.table_filters) {
+		if (!ExpressionFilter::IsOptionalFilter(entry.Filter())) {
+			return true;
+		}
+	}
+	return false;
 }
 
 static string TryBuildOrderByClause(const OrderByAndLimitOptimizer::Config &config, vector<BoundOrderByNode> &orders,
@@ -267,7 +284,7 @@ void OrderByAndLimitOptimizer::Optimize(const OrderByAndLimitOptimizer::Config &
 		LogicalGet *get = nullptr;
 		dbconnector::BindData *bind_data = nullptr;
 		if (OptimizerUtil::FindExtensionGet(config.table_scan_name, *op->children[0], get, bind_data) &&
-		    !(config.limit_unsafe && config.limit_unsafe(*get))) {
+		    !LimitFoldUnsafe(config, *get)) {
 			string order_clause = TryBuildOrderByClause(config, topn.orders, *op->children[0], *get);
 			if (!order_clause.empty()) {
 				auto &order_by_and_limit_bind_data = bind_data->GetOrderByAndLimitBindData();
@@ -326,7 +343,7 @@ void OrderByAndLimitOptimizer::Optimize(const OrderByAndLimitOptimizer::Config &
 		if (get.function.name != config.table_scan_name) {
 			return;
 		}
-		if (config.limit_unsafe && config.limit_unsafe(get)) {
+		if (LimitFoldUnsafe(config, get)) {
 			return;
 		}
 		switch (limit.limit_val.Type()) {

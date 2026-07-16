@@ -1,6 +1,5 @@
 #pragma once
 
-#include <functional>
 #include <string>
 
 #include "duckdb/main/client_context.hpp"
@@ -19,19 +18,13 @@ public:
 		char identifier_quote = '"';
 		query::QuoteEscapeStyle escape_style = query::QuoteEscapeStyle::DOUBLE_QUOTE;
 		std::string table_scan_name;
-		//! Per-order-key veto: called with the scan and the resolved TABLE column id
-		//! once an order key traces to it; return true to refuse folding that key's
-		//! sort remotely (e.g. the remote engine's ordering for the column's type
-		//! diverges from DuckDB's, so a remote sort would ship a different row set).
-		//! Null = every traceable key is safe (legacy behaviour).
-		std::function<bool(const duckdb::LogicalGet &get, duckdb::column_t column_id)> order_key_unsafe;
-		//! Scan-level veto for LIMIT-carrying folds (TOP_N and LIMIT): return true to
-		//! refuse when cutting rows remotely is unsafe -- e.g. the scan re-applies part
-		//! of its table filters locally, so a remote LIMIT would truncate the stream
-		//! BEFORE the local re-check and drop rows that belong in the result. A pure
-		//! ORDER BY fold is unaffected (local filtering preserves the row order).
-		//! Null = always safe (legacy behaviour).
-		std::function<bool(const duckdb::LogicalGet &get)> limit_unsafe;
+		//! False when the connector may re-apply the scan's table filters locally
+		//! (inexact remote pushdown): folding LIMIT/TOP_N would then truncate the
+		//! stream BEFORE the local re-check and drop rows that belong in the result.
+		//! A filterless scan still folds either way, and a pure ORDER BY fold is
+		//! unaffected (local filtering preserves the row order). True = always fold
+		//! (exact-pushdown engines, the legacy behaviour).
+		bool fold_limit_with_table_filters = true;
 	};
 
 	static Config CreateConfig(duckdb::ClientContext &ctx, const std::string &enabled_option, char identifier_quote,
