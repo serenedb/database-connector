@@ -367,18 +367,10 @@ void OrderByAndLimitOptimizer::Optimize(const OrderByAndLimitOptimizer::Config &
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_LIMIT) {
 		auto &limit = op->Cast<LogicalLimit>();
-		reference<LogicalOperator> child = *op->children[0];
-		while (child.get().type == LogicalOperatorType::LOGICAL_PROJECTION) {
-			child = *child.get().children[0];
-		}
-		if (child.get().type != LogicalOperatorType::LOGICAL_GET) {
-			return;
-		}
-		auto &get = child.get().Cast<LogicalGet>();
-		if (get.function.name != config.table_scan_name) {
-			return;
-		}
-		if (LimitFoldUnsafe(config, get)) {
+		LogicalGet *get = nullptr;
+		dbconnector::BindData *bind_data = nullptr;
+		if (!OptimizerUtil::FindExtensionGet(config.table_scan_name, *op->children[0], get, bind_data) ||
+		    LimitFoldUnsafe(config, *get)) {
 			return;
 		}
 		switch (limit.limit_val.Type()) {
@@ -395,8 +387,7 @@ void OrderByAndLimitOptimizer::Optimize(const OrderByAndLimitOptimizer::Config &
 		default:
 			return;
 		}
-		auto &bind_data = get.bind_data->Cast<dbconnector::BindData>();
-		auto &order_by_and_limit_bind_data = bind_data.GetOrderByAndLimitBindData();
+		auto &order_by_and_limit_bind_data = bind_data->GetOrderByAndLimitBindData();
 		if (!order_by_and_limit_bind_data.limit_clause.empty()) {
 			return;
 		}

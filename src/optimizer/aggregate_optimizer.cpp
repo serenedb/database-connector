@@ -184,6 +184,7 @@ static PushedAggregate TryPushAggregateToMySQL(const AggregateOptimizer::Config 
 
 	if (get.table_filters.HasFilters()) {
 		string where_clause;
+		auto scan_config = table_scan::FilterPushdown::CreateConfig('`', '\'', config.escape_style);
 		for (auto &entry : get.table_filters) {
 			ProjectionIndex proj_idx = entry.GetIndex();
 			ColumnIndex col_idx = get.GetColumnIndex(proj_idx);
@@ -192,7 +193,6 @@ static PushedAggregate TryPushAggregateToMySQL(const AggregateOptimizer::Config 
 				return res;
 			}
 			auto column_name = get.names[table_col_idx];
-			auto scan_config = table_scan::FilterPushdown::CreateConfig('`', '\'', config.escape_style);
 			auto new_filter = table_scan::FilterPushdown::TransformFilter(scan_config, column_name.GetIdentifierName(),
 			                                                              entry.Filter(), table_col_idx);
 			if (new_filter.empty()) {
