@@ -18,9 +18,8 @@ class FilterPushdown {
 
 public:
 	static Config CreateConfig(char identifier_quote, char constant_quote, query::QuoteEscapeStyle escape_style,
-	                           const std::string &blob_literal_prefix = std::string(),
-	                           const std::string &blob_literal_suffix = std::string(),
-	                           query::Dialect dialect = query::Dialect::Postgres);
+	                           query::Dialect dialect, const std::string &blob_literal_prefix = std::string(),
+	                           const std::string &blob_literal_suffix = std::string());
 
 	//! All-or-nothing: returns SQL equivalent to the filter, or an empty string
 	//! when any required piece cannot be rendered (the filter must then be
