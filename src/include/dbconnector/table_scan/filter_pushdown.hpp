@@ -26,20 +26,23 @@ public:
 	                           const std::string &blob_literal_suffix = std::string(),
 	                           query::Dialect dialect = query::Dialect::Postgres);
 
-	// `exact` (optional): when provided, set to false if the rendered SQL is WIDER
-	// than the filter (a dropped AND conjunct -> superset the caller must re-apply
-	// locally); a partial OR renders empty (the whole disjunction stays local)
-	// rather than a wrong subset. Passing nullptr keeps the legacy drop-and-widen
-	// behaviour, so existing callers are unaffected.
-	static std::string TransformFilter(const Config &config, const std::string &column_name,
-	                                   const duckdb::TableFilter &filter, duckdb::column_t column_id,
-	                                   bool *exact = nullptr);
+	struct RenderedFilter {
+		std::string sql;
+		//! False when `sql` is WIDER than the filter: an AND conjunct could not be
+		//! rendered and was dropped, so the remote returns a SUPERSET and the caller
+		//! must re-apply the full filter locally. An OR with an unrenderable branch
+		//! never widens -- the whole disjunction renders empty instead (a partial OR
+		//! would be a wrong subset).
+		bool exact = true;
+	};
+	static RenderedFilter TransformFilter(const Config &config, const std::string &column_name,
+	                                      const duckdb::TableFilter &filter, duckdb::column_t column_id);
 
 private:
 	static std::string TransformExpression(const query::QueryWriter::Config &identifier_config,
 	                                       const query::QueryWriter::Config &constant_config,
 	                                       const std::string &column_name, const duckdb::Expression &expr,
-	                                       duckdb::column_t column_id, bool *exact);
+	                                       duckdb::column_t column_id, bool &exact);
 	static std::string TransformExpressionSubject(const query::QueryWriter::Config &identifier_config,
 	                                              const std::string &column_name, const duckdb::Expression &expr);
 	static std::string TransformConstantFilter(const query::QueryWriter::Config &constant_config,
@@ -50,7 +53,7 @@ private:
 	                                    const query::QueryWriter::Config &constant_config,
 	                                    const std::string &column_name,
 	                                    const duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> &filters,
-	                                    const std::string &op, duckdb::column_t column_id, bool *exact);
+	                                    const std::string &op, duckdb::column_t column_id, bool &exact);
 };
 
 } // namespace table_scan
