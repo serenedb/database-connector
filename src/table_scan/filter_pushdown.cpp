@@ -48,14 +48,17 @@ std::string FilterPushdown::CreateExpression(const query::QueryWriter::Config &i
                                              const std::string &column_name,
                                              const vector<unique_ptr<Expression>> &filters, const std::string &op,
                                              column_t column_id) {
+	const bool is_or = op == "OR";
 	vector<std::string> filter_entries;
 	for (auto &filter : filters) {
 		auto new_filter = TransformExpression(identifier_config, constant_config, column_name, *filter, column_id);
 		if (new_filter.empty()) {
-			// Optional (advisory) pieces may be dropped from the SQL; dropping a
-			// required piece would make the SQL wider (AND) or narrower (OR) than
-			// the filter, so the whole filter renders empty and stays local.
-			if (IsOptionalFilterExpression(*filter)) {
+			// Optional (advisory) pieces may be dropped from an AND (widens the
+			// SQL, never the result). Dropping anything from an OR narrows the
+			// result, and dropping a required AND conjunct widens the SQL past
+			// the filter -- both make the SQL lie, so the whole filter renders
+			// empty and stays local.
+			if (!is_or && IsOptionalFilterExpression(*filter)) {
 				continue;
 			}
 			return std::string();
@@ -100,12 +103,12 @@ static bool IsDirectReference(const Expression &expr) {
 string FilterPushdown::TransformConstantFilter(const query::QueryWriter::Config &constant_config,
                                                const string &column_name, ExpressionType comparison_type,
                                                const Value &constant, column_t column_id) {
-	string constant_string;
 	if (IsVirtualColumn(column_id)) {
-		return "FALSE";
-	} else {
-		constant_string = query::QueryWriter::WriteConstant(constant_config, constant);
+		// A rowid has no remote SQL identity; rendering anything (the old FALSE)
+		// makes the SQL narrower than the filter. Unrenderable -> stays local.
+		return string();
 	}
+	string constant_string = query::QueryWriter::WriteConstant(constant_config, constant);
 	auto operator_string = TransformComparison(comparison_type);
 	string comparison = StringUtil::Format("%s %s %s", column_name, operator_string, constant_string);
 	// Postgres forces byte-wise comparison to match DuckDB; ClickHouse's String
@@ -211,7 +214,7 @@ std::string FilterPushdown::TransformExpression(const query::QueryWriter::Config
 			}
 			return std::string();
 		case ExpressionType::COMPARE_IN: {
-			if (subject.empty()) {
+			if (subject.empty() || IsVirtualColumn(column_id)) {
 				return string();
 			}
 			std::string in_list;
@@ -222,14 +225,10 @@ std::string FilterPushdown::TransformExpression(const query::QueryWriter::Config
 				if (!in_list.empty()) {
 					in_list += ", ";
 				}
-				if (IsVirtualColumn(column_id)) {
-					in_list += "FALSE";
-				} else {
-					in_list += query::QueryWriter::WriteConstant(
-					    constant_config, op.GetChildren()[i]->Cast<BoundConstantExpression>().GetValue());
-				}
+				in_list += query::QueryWriter::WriteConstant(
+				    constant_config, op.GetChildren()[i]->Cast<BoundConstantExpression>().GetValue());
 			}
-			return IsVirtualColumn(column_id) ? "FALSE" : subject + " IN (" + in_list + ")";
+			return subject + " IN (" + in_list + ")";
 		}
 		default:
 			return std::string();

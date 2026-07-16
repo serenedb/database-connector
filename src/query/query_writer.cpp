@@ -61,6 +61,12 @@ std::string QueryWriter::EncodeBlob(const QueryWriter::Config &config, const std
 }
 
 std::string QueryWriter::WriteConstant(const QueryWriter::Config &config, const duckdb::Value &val) {
+	// Every typed branch below assumes a non-NULL payload (StringValue::Get
+	// throws InternalException on NULL; ToString renders the word NULL inside
+	// a typed cast).
+	if (val.IsNull()) {
+		return "NULL";
+	}
 	// ClickHouse parses a bare literal wider than (U)Int64 as Float64, losing
 	// precision; render (U)HugeInt and Decimal via exact typed casts instead.
 	if (config.dialect == Dialect::ClickHouse) {
