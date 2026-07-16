@@ -15,7 +15,6 @@ namespace optimizer {
 struct TracedBindingColumn {
 	std::string col_name;
 	duckdb::LogicalType col_type;
-	duckdb::idx_t col_idx = 0;
 
 	bool Found() {
 		return !col_name.empty();

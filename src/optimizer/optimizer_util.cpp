@@ -70,7 +70,6 @@ TracedBindingColumn OptimizerUtil::TraceBindingToColumn(ColumnBinding binding, L
 	}
 	res.col_name = get.names[actual_col_idx].GetIdentifierName();
 	res.col_type = get.returned_types[actual_col_idx];
-	res.col_idx = actual_col_idx;
 	return res;
 }
 
