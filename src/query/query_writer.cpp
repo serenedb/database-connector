@@ -99,9 +99,12 @@ std::string QueryWriter::WriteConstant(const QueryWriter::Config &config, const 
 	if (val.type().id() == LogicalTypeId::BLOB) {
 		return EncodeBlob(config, StringValue::Get(val));
 	}
-	if (val.type().id() == LogicalTypeId::TIMESTAMP_TZ) {
-		return val.DefaultCastAs(LogicalType::TIMESTAMP).DefaultCastAs(LogicalType::VARCHAR).ToSQLString();
-	}
+	// TIMESTAMP_TZ deliberately falls through to the VARCHAR cast below: it
+	// renders WITH the UTC offset ('... 12:00:00+00'), which the remote parses
+	// as the correct instant regardless of its session time zone. Casting to
+	// naive TIMESTAMP first (the old behaviour) dropped the offset, so a
+	// non-UTC remote session re-interpreted the wall time in its own zone --
+	// silently shifted comparisons.
 	// A plain string constant: quote + escape per the config's escape_style so the
 	// literal is valid in the target dialect (ClickHouse treats backslash as an
 	// escape inside '...', so its BACKSLASH style escapes both ' and \; postgres'
