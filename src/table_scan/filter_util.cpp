@@ -12,9 +12,10 @@ const duckdb::Expression &FilterUtil::GetExpression(const duckdb::TableFilter &f
 }
 
 bool FilterUtil::IsInternalFilter(const duckdb::TableFilter &filter) {
-	auto &expr = GetExpression(filter, "FilterPushdown::IsInternalFilter");
-	return expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION &&
-	       expr.ToString().find("__internal_tablefilter_") == 0;
+	// Any optional filter is safe to skip. In practice only the dynamic filter needs this: the non-dynamic ones
+	// already have a string representation for filter pushdown. But if we ever forget to implement one, skipping it
+	// is still correct as long as it's optional, instead of raising an error.
+	return duckdb::ExpressionFilter::IsOptionalFilter(filter);
 }
 
 std::string FilterUtil::ToString(const duckdb::TableFilter &filter) {
