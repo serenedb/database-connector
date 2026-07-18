@@ -6,6 +6,7 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -27,18 +28,9 @@ FilterPushdown::Config FilterPushdown::CreateConfig(char identifier_quote, char 
 	Config res;
 	res.identifier =
 	    query::QueryWriter::CreateConfig(identifier_quote, escape_style, std::string(), std::string(), dialect);
-	res.constant =
-	    query::QueryWriter::CreateConfig(constant_quote, escape_style, blob_literal_prefix, blob_literal_suffix, dialect);
+	res.constant = query::QueryWriter::CreateConfig(constant_quote, escape_style, blob_literal_prefix,
+	                                                blob_literal_suffix, dialect);
 	return res;
-}
-
-static bool IsOptionalFilterExpression(const Expression &expr) {
-	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
-		return false;
-	}
-	auto &name = expr.Cast<BoundFunctionExpression>().Function().GetName();
-	return name == OptionalFilterScalarFun::NAME || name == SelectivityOptionalFilterScalarFun::NAME ||
-	       name == DynamicFilterScalarFun::NAME;
 }
 
 std::string FilterPushdown::CreateExpression(const query::QueryWriter::Config &identifier_config,
@@ -51,12 +43,12 @@ std::string FilterPushdown::CreateExpression(const query::QueryWriter::Config &i
 	for (auto &filter : filters) {
 		auto new_filter = TransformExpression(identifier_config, constant_config, column_name, *filter, column_id);
 		if (new_filter.empty()) {
-			// Optional (advisory) pieces may be dropped from an AND (widens the
-			// SQL, never the result). Dropping anything from an OR narrows the
-			// result, and dropping a required AND conjunct widens the SQL past
-			// the filter -- both make the SQL lie, so the whole filter renders
-			// empty and stays local.
-			if (!is_or && IsOptionalFilterExpression(*filter)) {
+			// An optional (advisory) filter wrapper may be dropped from an AND: it
+			// widens the SQL, never the result (the real predicate is enforced above
+			// the scan). Dropping anything from an OR narrows the result, and dropping
+			// a real AND conjunct widens the SQL past the filter -- both make the SQL
+			// lie, so the whole filter renders empty and stays local.
+			if (!is_or && ExpressionFilter::IsRootOptionalExpression(*filter)) {
 				continue;
 			}
 			return std::string();
@@ -111,8 +103,7 @@ string FilterPushdown::TransformConstantFilter(const query::QueryWriter::Config 
 	string comparison = StringUtil::Format("%s %s %s", column_name, operator_string, constant_string);
 	// Postgres forces byte-wise comparison to match DuckDB; ClickHouse's String
 	// comparison is already byte-wise and rejects the COLLATE clause.
-	if (constant.type().id() == LogicalTypeId::VARCHAR &&
-	    constant_config.dialect == query::Dialect::Postgres) {
+	if (constant.type().id() == LogicalTypeId::VARCHAR && constant_config.dialect == query::Dialect::Postgres) {
 		comparison += " COLLATE \"C\"";
 	}
 	return comparison;
