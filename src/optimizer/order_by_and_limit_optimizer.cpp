@@ -8,6 +8,7 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 
 #include "dbconnector/bind_data.hpp"
 #include "dbconnector/optimizer/optimizer_util.hpp"
@@ -20,7 +21,8 @@ using namespace duckdb;
 
 OrderByAndLimitOptimizer::Config
 OrderByAndLimitOptimizer::CreateConfig(ClientContext &ctx, const std::string &enabled_option, char identifier_quote,
-                                       query::QuoteEscapeStyle escape_style, std::string table_scan_name) {
+                                       query::QuoteEscapeStyle escape_style, std::string table_scan_name,
+                                       query::Dialect dialect) {
 	Config res;
 
 	res.enabled = false;
@@ -32,68 +34,89 @@ OrderByAndLimitOptimizer::CreateConfig(ClientContext &ctx, const std::string &en
 	res.identifier_quote = identifier_quote;
 	res.escape_style = escape_style;
 	res.table_scan_name = std::move(table_scan_name);
+	res.dialect = dialect;
 
 	return res;
 }
 
-static string TraceColumnToGet(const OrderByAndLimitOptimizer::Config &config, Expression &expr, LogicalOperator &child,
-                               LogicalGet &get) {
+// Traces an ORDER BY key expression to a scan column; false when the key is
+// not a plain scan column.
+static bool TraceOrderKey(const OrderByAndLimitOptimizer::Config &config, Expression &expr, LogicalOperator &child,
+                          LogicalGet &get, string &quoted, LogicalType &type) {
 	if (expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
-		return std::string();
+		return false;
 	}
 	auto &col_ref = expr.Cast<BoundColumnRefExpression>();
 	if (col_ref.Depth() > 0) {
-		return std::string();
+		return false;
 	}
-	auto binding = col_ref.BindingMutable();
-
-	reference<LogicalOperator> current = child;
-	while (current.get().type == LogicalOperatorType::LOGICAL_PROJECTION) {
-		auto &proj = current.get().Cast<LogicalProjection>();
-		if (binding.table_index != proj.table_index) {
-			break;
-		}
-		if (binding.column_index >= proj.expressions.size()) {
-			return std::string();
-		}
-		auto &proj_expr = *proj.expressions[binding.column_index];
-		if (proj_expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
-			return std::string();
-		}
-		auto &inner_ref = proj_expr.Cast<BoundColumnRefExpression>();
-		if (inner_ref.Depth() > 0) {
-			return std::string();
-		}
-		binding = inner_ref.BindingMutable();
-		current = *current.get().children[0];
-	}
-
-	if (binding.table_index != get.table_index) {
-		return std::string();
-	}
-	auto &column_ids = get.GetColumnIds();
-	if (binding.column_index >= column_ids.size()) {
-		return std::string();
-	}
-	auto &col_index = column_ids[binding.column_index];
-	if (col_index.IsRowIdColumn()) {
-		return std::string();
-	}
-
-	auto actual_col_idx = col_index.GetPrimaryIndex();
-	if (actual_col_idx >= get.names.size()) {
-		return std::string();
+	auto traced = OptimizerUtil::TraceBindingToColumn(col_ref.BindingMutable(), child, get);
+	if (!traced.Found()) {
+		return false;
 	}
 	auto query_config = query::QueryWriter::CreateConfig(config.identifier_quote, config.escape_style);
-	return query::QueryWriter::WriteQuotedAndEscaped(query_config, get.names[actual_col_idx].GetIdentifierName());
+	quoted = query::QueryWriter::WriteQuotedAndEscaped(query_config, traced.col_name);
+	type = traced.col_type;
+	return true;
+}
+
+// True when `type` nests a scalar whose ClickHouse ordering diverges from
+// DuckDB's: a divergent field cannot be rewritten inside a whole-value
+// comparison, so such keys stay local. VARCHAR is included because an Enum
+// (ordinal order remotely) is indistinguishable from a plain String here.
+static bool CompoundContainsDivergent(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::UUID:
+	case LogicalTypeId::VARCHAR:
+		return true;
+	case LogicalTypeId::STRUCT: {
+		for (auto &child : StructType::GetChildTypes(type)) {
+			if (CompoundContainsDivergent(child.second)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	case LogicalTypeId::LIST:
+		return CompoundContainsDivergent(ListType::GetChildType(type));
+	case LogicalTypeId::ARRAY:
+		return CompoundContainsDivergent(ArrayType::GetChildType(type));
+	case LogicalTypeId::MAP:
+		return CompoundContainsDivergent(MapType::KeyType(type)) ||
+		       CompoundContainsDivergent(MapType::ValueType(type));
+	default:
+		return false;
+	}
+}
+
+static bool LimitFoldUnsafe(const OrderByAndLimitOptimizer::Config &config, const LogicalGet &get) {
+	// Postgres filter pushdown is exact-or-error: every required filter runs in
+	// the remote statement, WHERE before LIMIT, so folding is always safe. Other
+	// engines' comparison semantics (ClickHouse: NaN, Enum ordinals, literals
+	// parsed in the server time zone) force connectors to keep some required
+	// filters local and re-apply them AFTER the fetch -- a folded LIMIT would
+	// truncate the stream before that re-check and drop qualifying rows.
+	// Optional (advisory) filters never change the row set and do not block.
+	if (config.dialect == query::Dialect::Postgres) {
+		return false;
+	}
+	for (auto &entry : get.table_filters) {
+		if (!ExpressionFilter::IsOptionalFilter(entry.Filter())) {
+			return true;
+		}
+	}
+	return false;
 }
 
 static string TryBuildOrderByClause(const OrderByAndLimitOptimizer::Config &config, vector<BoundOrderByNode> &orders,
                                     LogicalOperator &child, LogicalGet &get) {
 	vector<string> fragments;
 	for (auto &order : orders) {
-		string col_name = TraceColumnToGet(config, *order.expression, child, get);
-		if (col_name.empty()) {
+		string quoted;
+		LogicalType key_type;
+		if (!TraceOrderKey(config, *order.expression, child, get, quoted, key_type)) {
 			return std::string();
 		}
 
@@ -108,19 +131,53 @@ static string TryBuildOrderByClause(const OrderByAndLimitOptimizer::Config &conf
 			    (direction == OrderType::ASCENDING) ? OrderByNullType::NULLS_LAST : OrderByNullType::NULLS_FIRST;
 		}
 
-		if (direction == OrderType::ASCENDING) {
-			if (null_order == OrderByNullType::NULLS_FIRST) {
-				fragments.push_back(col_name + " ASC");
-			} else {
-				fragments.push_back(col_name + " IS NULL, " + col_name + " ASC");
+		// Emit an explicit IS [NOT] NULL prefix key for BOTH null placements instead
+		// of relying on the remote engine's default, which differs per engine (MySQL
+		// sorts NULLs first on ASC; Postgres and ClickHouse sort them last). A bare
+		// "col ASC" for NULLS FIRST returns the wrong rows on the latter two -- and
+		// since the fold removes the local sort node, nothing downstream corrects it.
+		const char *null_key = (null_order == OrderByNullType::NULLS_FIRST) ? " IS NOT NULL, " : " IS NULL, ";
+		const char *dir = (direction == OrderType::ASCENDING) ? " ASC" : " DESC";
+
+		// Rewrite the value key per dialect so the remote reproduces DuckDB's
+		// ordering: an isNaN() prefix pins NaN to the greatest position (CH
+		// compares IEEE); toString() restores byte-wise text order for CH's
+		// text-backed columns and half-swapped UUIDs (the connector surfaces
+		// those AS their toString() text, so the orders match by construction);
+		// COLLATE "C" replaces postgres' locale collation with byte order.
+		string value_key = quoted;
+		string nan_key;
+		switch (config.dialect) {
+		case query::Dialect::ClickHouse:
+			switch (key_type.id()) {
+			case LogicalTypeId::FLOAT:
+			case LogicalTypeId::DOUBLE:
+				nan_key = "isNaN(" + quoted + ")" + dir + ", ";
+				break;
+			case LogicalTypeId::VARCHAR:
+			case LogicalTypeId::UUID:
+				value_key = "toString(" + quoted + ")";
+				break;
+			case LogicalTypeId::STRUCT:
+			case LogicalTypeId::LIST:
+			case LogicalTypeId::ARRAY:
+			case LogicalTypeId::MAP:
+				if (CompoundContainsDivergent(key_type)) {
+					return std::string();
+				}
+				break;
+			default:
+				break;
 			}
-		} else {
-			if (null_order == OrderByNullType::NULLS_FIRST) {
-				fragments.push_back(col_name + " IS NOT NULL, " + col_name + " DESC");
-			} else {
-				fragments.push_back(col_name + " DESC");
+			break;
+		case query::Dialect::Postgres:
+			if (key_type.id() == LogicalTypeId::VARCHAR) {
+				value_key = quoted + " COLLATE \"C\"";
 			}
+			break;
 		}
+
+		fragments.push_back(quoted + null_key + nan_key + value_key + dir);
 	}
 	return " ORDER BY " + StringUtil::Join(fragments, ", ");
 }
@@ -170,12 +227,15 @@ static void PruneProjectionLayer(LogicalProjection &proj, const unordered_set<id
 }
 
 static void PruneColumnsAfterOrderByRemoval(LogicalOperator &child, LogicalGet &get,
-                                            const vector<idx_t> &projection_map) {
+                                            const vector<ProjectionIndex> &projection_map) {
 	if (child.type == LogicalOperatorType::LOGICAL_GET) {
-		auto &column_ids = get.GetColumnIds();
+		// projection_map entries are positions in the child's OUTPUT; resolve them
+		// through the bindings (which honor projection_ids) instead of indexing
+		// column_ids positionally -- the two spaces differ on non-identity scans.
+		auto bindings = get.GetColumnBindings();
 		vector<ColumnIndex> new_ids;
-		for (auto idx : projection_map) {
-			new_ids.push_back(column_ids[idx]);
+		for (auto pos : projection_map) {
+			new_ids.push_back(get.GetColumnIndex(bindings[pos]));
 		}
 		get.SetColumnIds(std::move(new_ids));
 		get.projection_ids.clear();
@@ -256,7 +316,8 @@ void OrderByAndLimitOptimizer::Optimize(const OrderByAndLimitOptimizer::Config &
 		auto &topn = op->Cast<LogicalTopN>();
 		LogicalGet *get = nullptr;
 		dbconnector::BindData *bind_data = nullptr;
-		if (OptimizerUtil::FindExtensionGet(config.table_scan_name, *op->children[0], get, bind_data)) {
+		if (OptimizerUtil::FindExtensionGet(config.table_scan_name, *op->children[0], get, bind_data) &&
+		    !LimitFoldUnsafe(config, *get)) {
 			string order_clause = TryBuildOrderByClause(config, topn.orders, *op->children[0], *get);
 			if (!order_clause.empty()) {
 				auto &order_by_and_limit_bind_data = bind_data->GetOrderByAndLimitBindData();
@@ -284,14 +345,7 @@ void OrderByAndLimitOptimizer::Optimize(const OrderByAndLimitOptimizer::Config &
 				auto &order_by_and_limit_bind_data = bind_data->GetOrderByAndLimitBindData();
 				order_by_and_limit_bind_data.order_by_clause = order_clause;
 				if (!order.projection_map.empty()) {
-					vector<column_t> indices;
-					indices.reserve(order.projection_map.size());
-					for (auto proj_idx : order.projection_map) {
-						ColumnIndex col_idx = get->GetColumnIndex(proj_idx);
-						column_t table_col_idx = col_idx.GetPrimaryIndex();
-						indices.emplace_back(table_col_idx);
-					}
-					PruneColumnsAfterOrderByRemoval(*op->children[0], *get, indices);
+					PruneColumnsAfterOrderByRemoval(*op->children[0], *get, order.projection_map);
 				}
 				op = std::move(op->children[0]);
 				return;
@@ -304,15 +358,10 @@ void OrderByAndLimitOptimizer::Optimize(const OrderByAndLimitOptimizer::Config &
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_LIMIT) {
 		auto &limit = op->Cast<LogicalLimit>();
-		reference<LogicalOperator> child = *op->children[0];
-		while (child.get().type == LogicalOperatorType::LOGICAL_PROJECTION) {
-			child = *child.get().children[0];
-		}
-		if (child.get().type != LogicalOperatorType::LOGICAL_GET) {
-			return;
-		}
-		auto &get = child.get().Cast<LogicalGet>();
-		if (get.function.name != config.table_scan_name) {
+		LogicalGet *get = nullptr;
+		dbconnector::BindData *bind_data = nullptr;
+		if (!OptimizerUtil::FindExtensionGet(config.table_scan_name, *op->children[0], get, bind_data) ||
+		    LimitFoldUnsafe(config, *get)) {
 			return;
 		}
 		switch (limit.limit_val.Type()) {
@@ -329,8 +378,7 @@ void OrderByAndLimitOptimizer::Optimize(const OrderByAndLimitOptimizer::Config &
 		default:
 			return;
 		}
-		auto &bind_data = get.bind_data->Cast<dbconnector::BindData>();
-		auto &order_by_and_limit_bind_data = bind_data.GetOrderByAndLimitBindData();
+		auto &order_by_and_limit_bind_data = bind_data->GetOrderByAndLimitBindData();
 		if (!order_by_and_limit_bind_data.limit_clause.empty()) {
 			return;
 		}

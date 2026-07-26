@@ -12,18 +12,19 @@ namespace table_scan {
 
 class FilterPushdown {
 	struct Config {
-		char identifier_quote = '"';
-		char constant_quote = '\'';
-		query::QuoteEscapeStyle escape_style = query::QuoteEscapeStyle::DOUBLE_QUOTE;
-		std::string blob_literal_prefix;
-		std::string blob_literal_suffix;
+		query::QueryWriter::Config identifier;
+		query::QueryWriter::Config constant;
 	};
 
 public:
 	static Config CreateConfig(char identifier_quote, char constant_quote, query::QuoteEscapeStyle escape_style,
-	                           const std::string &blob_literal_prefix = std::string(),
+	                           query::Dialect dialect, const std::string &blob_literal_prefix = std::string(),
 	                           const std::string &blob_literal_suffix = std::string());
 
+	//! All-or-nothing: returns SQL equivalent to the filter, or an empty string
+	//! when any required piece cannot be rendered (the filter must then be
+	//! applied locally). Only optional (advisory) pieces may be dropped from
+	//! the rendered SQL -- correctness never depends on them.
 	static std::string TransformFilter(const Config &config, const std::string &column_name,
 	                                   const duckdb::TableFilter &filter, duckdb::column_t column_id);
 

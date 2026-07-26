@@ -7,12 +7,13 @@ namespace query {
 
 QueryWriter::Config QueryWriter::CreateConfig(char quote, QuoteEscapeStyle escape_style,
                                               const std::string &blob_literal_prefix,
-                                              const std::string &blob_literal_suffix) {
+                                              const std::string &blob_literal_suffix, Dialect dialect) {
 	Config res;
 	res.quote = quote;
 	res.escape_style = escape_style;
 	res.blob_literal_prefix = blob_literal_prefix;
 	res.blob_literal_suffix = blob_literal_suffix;
+	res.dialect = dialect;
 	return res;
 }
 
@@ -60,16 +61,45 @@ std::string QueryWriter::EncodeBlob(const QueryWriter::Config &config, const std
 }
 
 std::string QueryWriter::WriteConstant(const QueryWriter::Config &config, const duckdb::Value &val) {
+	// Every typed branch below assumes a non-NULL payload (StringValue::Get
+	// throws InternalException on NULL; ToString renders the word NULL inside
+	// a typed cast).
+	if (val.IsNull()) {
+		return "NULL";
+	}
+	// ClickHouse parses a bare literal wider than (U)Int64 as Float64, losing
+	// precision; render (U)HugeInt and Decimal via exact typed casts instead.
+	if (config.dialect == Dialect::ClickHouse) {
+		switch (val.type().id()) {
+		case duckdb::LogicalTypeId::HUGEINT:
+			return "toInt128('" + val.ToString() + "')";
+		case duckdb::LogicalTypeId::UHUGEINT:
+			return "toUInt128('" + val.ToString() + "')";
+		case duckdb::LogicalTypeId::DECIMAL:
+			return "toDecimal128('" + val.ToString() + "', " +
+			       std::to_string(duckdb::DecimalType::GetScale(val.type())) + ")";
+		default:
+			break;
+		}
+	}
 	if (val.type().IsNumeric() || val.type().id() == duckdb::LogicalTypeId::BOOLEAN) {
 		return val.ToSQLString();
 	}
 	if (val.type().id() == duckdb::LogicalTypeId::BLOB) {
 		return EncodeBlob(config, duckdb::StringValue::Get(val));
 	}
-	if (val.type().id() == duckdb::LogicalTypeId::TIMESTAMP_TZ) {
-		return val.DefaultCastAs(duckdb::LogicalType::TIMESTAMP)
-		    .DefaultCastAs(duckdb::LogicalType::VARCHAR)
-		    .ToSQLString();
+	// TIMESTAMP_TZ deliberately falls through to the VARCHAR cast below: it
+	// renders WITH the UTC offset ('... 12:00:00+00'), which the remote parses
+	// as the correct instant regardless of its session time zone. Casting to
+	// naive TIMESTAMP first (the old behaviour) dropped the offset, so a
+	// non-UTC remote session re-interpreted the wall time in its own zone --
+	// silently shifted comparisons.
+	// A plain string constant: quote + escape per the config's escape_style so the
+	// literal is valid in the target dialect (ClickHouse treats backslash as an
+	// escape inside '...', so its BACKSLASH style escapes both ' and \; postgres'
+	// DOUBLE_QUOTE style doubles ' and leaves \ literal -- matching ToSQLString).
+	if (val.type().id() == duckdb::LogicalTypeId::VARCHAR) {
+		return WriteQuotedAndEscaped(config, duckdb::StringValue::Get(val));
 	}
 	return val.DefaultCastAs(duckdb::LogicalType::VARCHAR).ToSQLString();
 }
