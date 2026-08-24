@@ -184,8 +184,8 @@ static PushedAggregate TryPushAggregateToMySQL(const AggregateOptimizer::Config 
 
 	if (get.table_filters.HasFilters()) {
 		string where_clause;
-		auto scan_config = table_scan::FilterPushdown::CreateConfig('`', '\'', config.escape_style,
-		                                                            query::Dialect::Postgres);
+		auto scan_config =
+		    table_scan::FilterPushdown::CreateConfig('`', '\'', config.escape_style, query::Dialect::Postgres);
 		for (auto &entry : get.table_filters) {
 			ProjectionIndex proj_idx = entry.GetIndex();
 			ColumnIndex col_idx = get.GetColumnIndex(proj_idx);

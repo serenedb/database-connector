@@ -28,8 +28,8 @@ FilterPushdown::Config FilterPushdown::CreateConfig(char identifier_quote, char 
 	Config res;
 	res.identifier =
 	    query::QueryWriter::CreateConfig(identifier_quote, escape_style, std::string(), std::string(), dialect);
-	res.constant =
-	    query::QueryWriter::CreateConfig(constant_quote, escape_style, blob_literal_prefix, blob_literal_suffix, dialect);
+	res.constant = query::QueryWriter::CreateConfig(constant_quote, escape_style, blob_literal_prefix,
+	                                                blob_literal_suffix, dialect);
 	return res;
 }
 
@@ -103,8 +103,7 @@ string FilterPushdown::TransformConstantFilter(const query::QueryWriter::Config 
 	string comparison = StringUtil::Format("%s %s %s", column_name, operator_string, constant_string);
 	// Postgres forces byte-wise comparison to match DuckDB; ClickHouse's String
 	// comparison is already byte-wise and rejects the COLLATE clause.
-	if (constant.type().id() == LogicalTypeId::VARCHAR &&
-	    constant_config.dialect == query::Dialect::Postgres) {
+	if (constant.type().id() == LogicalTypeId::VARCHAR && constant_config.dialect == query::Dialect::Postgres) {
 		comparison += " COLLATE \"C\"";
 	}
 	return comparison;

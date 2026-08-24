@@ -84,8 +84,7 @@ static bool CompoundContainsDivergent(const LogicalType &type) {
 	case LogicalTypeId::ARRAY:
 		return CompoundContainsDivergent(ArrayType::GetChildType(type));
 	case LogicalTypeId::MAP:
-		return CompoundContainsDivergent(MapType::KeyType(type)) ||
-		       CompoundContainsDivergent(MapType::ValueType(type));
+		return CompoundContainsDivergent(MapType::KeyType(type)) || CompoundContainsDivergent(MapType::ValueType(type));
 	default:
 		return false;
 	}
