@@ -32,7 +32,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     $ENV{DUCKDB_SRC_PATH}/src/include
     $ENV{DUCKDB_SRC_PATH}/third_party/fmt/include
     ../../src/include
-    ../catch
+    $ENV{DUCKDB_SRC_PATH}/third_party/catch
     ../include
 )
 
