@@ -20,7 +20,6 @@ add_executable(${PROJECT_NAME}
 target_include_directories(${PROJECT_NAME} PRIVATE
     ../src/include
     ../../duckdb/third_party/catch
-    # duckdb_capi
     include
 )
 
